@@ -8,28 +8,25 @@ import time
 import threading
 import json
 import logging
+import datetime
 
 # ======================== НАСТРОЙКА ПУТЕЙ ДЛЯ ХОСТИНГА ============================
-# Определяем папку для хранения данных (БД, файлы настроек, если нужно)
 DATA_DIR = os.environ.get('DATA_DIR', '/app/data')
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR, exist_ok=True)
 
-# Основная БД и префикс для аудиторий теперь лежат в DATA_DIR
 MAIN_DB = os.path.join(DATA_DIR, "assistant.db")
 AUDIENCE_DB_PREFIX = "audience_"
+RESTART_PEER_FILE = os.path.join(DATA_DIR, "restart_peer_id.txt")
 # =================================================================================
 
-# Импорт переменных из config.py или из переменных окружения
 try:
     from config import *
 except (ImportError, NameError):
-    # Если config отсутствует или переменные не определены, читаем из окружения
     GROUP_TOKEN = os.environ.get('GROUP_TOKEN')
     GROUP_ID = os.environ.get('GROUP_ID')
     OWNER_ID = os.environ.get('OWNER_ID')
 
-# Проверяем, что все переменные определены
 if not GROUP_TOKEN or not GROUP_ID or not OWNER_ID:
     print("❌ Ошибка: не заданы GROUP_TOKEN, GROUP_ID, OWNER_ID!")
     print("Убедитесь, что они есть в config.py или в переменных окружения.")
@@ -39,10 +36,35 @@ import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+# ======================== ОТПРАВКА ОШИБОК ВЛАДЕЛЬЦУ ============================
+class VkErrorHandler(logging.Handler):
+    """Обработчик логов, отправляющий ошибки владельцу бота."""
+    def emit(self, record):
+        if record.levelno >= logging.ERROR:
+            try:
+                msg = self.format(record)
+                if 'vk' in globals() and vk:
+                    vk.messages.send(
+                        peer_id=int(OWNER_ID),
+                        message=f"❌ Ошибка в боте:\n{msg}",
+                        random_id=random.getrandbits(31)
+                    )
+            except:
+                pass
 
+def send_to_owner(text):
+    """Отправить сообщение владельцу бота в ЛС."""
+    try:
+        if 'vk' in globals() and vk:
+            vk.messages.send(
+                peer_id=int(OWNER_ID),
+                message=text,
+                random_id=random.getrandbits(31)
+            )
+    except:
+        pass
 # ======================== РАБОТА С БАЗАМИ ДАННЫХ ============================
 
 DB_LOCK = threading.RLock()
@@ -99,6 +121,8 @@ def create_audience_schema(conn):
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('report_template', '')")
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('test_time_limit', '30')")
     cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('test_fail_threshold', '5')")
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('welcome_message', '')")
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('welcome_enabled', '1')")
     conn.commit()
 
 def get_db_connection(peer_id=None):
@@ -196,16 +220,152 @@ def init_main_db():
                 FOREIGN KEY (question_id) REFERENCES test_questions(id) ON DELETE CASCADE
             )
         ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS user_nicknames (
+                peer_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                nickname TEXT NOT NULL,
+                set_by TEXT,
+                set_at INTEGER,
+                PRIMARY KEY (peer_id, user_id)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS audience_students (
+                peer_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                added_by TEXT NOT NULL,
+                added_at INTEGER,
+                status TEXT DEFAULT 'active',
+                finished_at INTEGER,
+                result TEXT,
+                PRIMARY KEY (peer_id, user_id)
+            )
+        ''')
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('datacenter_peer_id', '')")
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st1_text', '')")
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('st2_text', '')")
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('report_template', '')")
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('test_time_limit', '30')")
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('test_fail_threshold', '5')")
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('notification_chat_id', '')")
         conn.commit()
     finally:
         conn.close()
+def cleanup_audience_dbs():
+    expected_tables = {'creative', 'topics', 'settings', 'test_questions', 'test_options'}
+    removed_count = 0
+    for filename in os.listdir(DATA_DIR):
+        if not filename.startswith(AUDIENCE_DB_PREFIX) or not filename.endswith('.db'):
+            continue
+        filepath = os.path.join(DATA_DIR, filename)
+        try:
+            conn = sqlite3.connect(filepath, timeout=30)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [row['name'] for row in cur.fetchall()]
+            for table in tables:
+                if table.startswith('sqlite_'):   # <-- пропускаем системные таблицы
+                    continue
+                if table not in expected_tables:
+                    cur.execute(f"DROP TABLE IF EXISTS {table}")
+                    logger.info(f"Удалена лишняя таблица '{table}' из {filename}")
+                    removed_count += 1
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"Ошибка при очистке {filename}: {e}")
+    logger.info(f"Очистка завершена. Удалено {removed_count} лишних таблиц.")
+def auto_repair_audiences():
+    """Автоматическое восстановление аудиторий при запуске:
+       - исправляет confirmed = 0, если БД существует
+       - удаляет записи аудиторий без файла БД (кроме датацентра)
+       - проверяет и корректирует datacenter_peer_id и notification_chat_id
+       - удаляет сирот из audience_students и user_nicknames
+    """
+    conn = get_db_connection(None)
+    repaired = 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT peer_id, confirmed, is_datacenter FROM audiences")
+        rows = cur.fetchall()
+        for row in rows:
+            peer_id = row['peer_id']
+            confirmed = row['confirmed']
+            is_dc = row['is_datacenter']
+            db_file = get_db_path(peer_id)
+            db_exists = os.path.exists(db_file)
 
+            if db_exists and confirmed == 0:
+                cur.execute("UPDATE audiences SET confirmed = 1 WHERE peer_id = ?", (peer_id,))
+                repaired += 1
+                logger.info(f"Аудитория {peer_id} восстановлена: confirmed = 1 (БД существует)")
+            elif not db_exists and confirmed == 1 and not is_dc:
+                cur.execute("DELETE FROM audiences WHERE peer_id = ?", (peer_id,))
+                cur.execute("DELETE FROM audience_students WHERE peer_id = ?", (peer_id,))
+                cur.execute("DELETE FROM user_nicknames WHERE peer_id = ?", (peer_id,))
+                repaired += 1
+                logger.info(f"Удалена запись аудитории {peer_id} (БД отсутствует)")
+            elif not db_exists and is_dc:
+                logger.warning(f"Датацентр {peer_id} не имеет файла БД, но запись существует. Рекомендуется проверить.")
+
+        dc_id = get_datacenter_peer_id()
+        if dc_id:
+            cur.execute("SELECT is_datacenter FROM audiences WHERE peer_id = ?", (dc_id,))
+            row = cur.fetchone()
+            if not row or row['is_datacenter'] != 1:
+                set_datacenter_peer_id(None)
+                logger.warning(f"Сброшен datacenter_peer_id = {dc_id} (не соответствует записи)")
+                repaired += 1
+
+        notif_chat = get_notification_chat()
+        if notif_chat:
+            cur.execute("SELECT confirmed FROM audiences WHERE peer_id = ?", (notif_chat,))
+            row = cur.fetchone()
+            if not row or row['confirmed'] == 0:
+                set_notification_chat(None)
+                logger.warning(f"Сброшен notification_chat_id = {notif_chat} (не подтверждена или отсутствует)")
+                repaired += 1
+
+        cur.execute("DELETE FROM audience_students WHERE peer_id NOT IN (SELECT peer_id FROM audiences)")
+        if cur.rowcount > 0:
+            logger.info(f"Удалено {cur.rowcount} сирот из audience_students")
+        cur.execute("DELETE FROM user_nicknames WHERE peer_id NOT IN (SELECT peer_id FROM audiences)")
+        if cur.rowcount > 0:
+            logger.info(f"Удалено {cur.rowcount} сирот из user_nicknames")
+        # === ОЧИСТКА option_label ===
+        cur.execute("UPDATE test_options SET option_label = trim(replace(replace(option_label, ')', ''), '.', ''))")
+        if cur.rowcount > 0:
+            logger.info(f"Исправлено {cur.rowcount} записей test_options в глобальной БД")
+
+        cur.execute("SELECT peer_id FROM audiences WHERE confirmed=1 AND is_datacenter=0")
+        audience_rows = cur.fetchall()
+        for row in audience_rows:
+            peer_id = row['peer_id']
+            db_file = get_db_path(peer_id)
+            if os.path.exists(db_file):
+                try:
+                    conn_aud = sqlite3.connect(db_file, timeout=30)
+                    conn_aud.row_factory = sqlite3.Row
+                    cur_aud = conn_aud.cursor()
+                    cur_aud.execute("UPDATE test_options SET option_label = trim(replace(replace(option_label, ')', ''), '.', ''))")
+                    if cur_aud.rowcount > 0:
+                        logger.info(f"Исправлено {cur_aud.rowcount} записей в аудитории {peer_id}")
+                    conn_aud.commit()
+                    conn_aud.close()
+                except Exception as e:
+                    logger.error(f"Ошибка очистки test_options в аудитории {peer_id}: {e}")
+        # === КОНЕЦ БЛОКА ===
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Ошибка при автоматическом восстановлении аудиторий: {e}")
+    finally:
+        conn.close()
+    if repaired:
+        logger.info(f"Автовосстановление завершено. Исправлено {repaired} проблем.")
+    else:
+        logger.info("Автовосстановление не потребовалось.")
 def delete_audience_db(peer_id):
     if is_datacenter(peer_id):
         return True
@@ -404,11 +564,131 @@ def has_one_by_one_test(topic, variant, peer_id):
     finally:
         conn.close()
 
+# -------------------- ФУНКЦИИ ДЛЯ НИКНЕЙМОВ, СТУДЕНТОВ, УВЕДОМЛЕНИЙ --------------------
+
+def set_user_nickname(user_id, nickname, peer_id, set_by=None):
+    conn = get_db_connection(None)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO user_nicknames (peer_id, user_id, nickname, set_by, set_at) VALUES (?, ?, ?, ?, ?)",
+            (peer_id, str(user_id), nickname, str(set_by) if set_by else None, int(time.time()))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_user_nickname(user_id, peer_id):
+    conn = get_db_connection(None)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT nickname FROM user_nicknames WHERE peer_id=? AND user_id=?", (peer_id, str(user_id)))
+        row = cur.fetchone()
+        return row['nickname'] if row else None
+    finally:
+        conn.close()
+
+def get_user_mention(user_id, peer_id):
+    nickname = get_user_nickname(user_id, peer_id)
+    if nickname:
+        return f"[id{user_id}|{nickname}]"
+    else:
+        try:
+            user = vk.users.get(user_ids=user_id)[0]
+            name = f"{user['first_name']} {user['last_name']}"
+        except:
+            name = f"id{user_id}"
+        return f"[id{user_id}|{name}]"
+
+def add_student(peer_id, user_id, added_by):
+    conn = get_db_connection(None)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO audience_students (peer_id, user_id, added_by, added_at, status) VALUES (?, ?, ?, ?, 'active')",
+            (peer_id, str(user_id), str(added_by), int(time.time()))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def remove_student(peer_id, user_id):
+    conn = get_db_connection(None)
+    try:
+        conn.execute("DELETE FROM audience_students WHERE peer_id=? AND user_id=?", (peer_id, str(user_id)))
+        conn.commit()
+    finally:
+        conn.close()
+
+def finish_student(peer_id, user_id, result):
+    conn = get_db_connection(None)
+    try:
+        conn.execute(
+            "UPDATE audience_students SET status='finished', finished_at=?, result=? WHERE peer_id=? AND user_id=?",
+            (int(time.time()), result, peer_id, str(user_id))
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_audience_students(peer_id):
+    conn = get_db_connection(None)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, added_by, added_at, status, result FROM audience_students WHERE peer_id=? AND status='active'", (peer_id,))
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+def get_student(peer_id, user_id):
+    conn = get_db_connection(None)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM audience_students WHERE peer_id=? AND user_id=?", (peer_id, str(user_id)))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+# ==================== ФУНКЦИИ ДЛЯ ПРИВЕТСТВИЯ ====================
+
+def get_welcome_message(peer_id):
+    return get_setting("welcome_message", "", peer_id)
+
+def set_welcome_message(peer_id, text):
+    set_setting("welcome_message", text, peer_id)
+
+def is_welcome_enabled(peer_id):
+    val = get_setting("welcome_enabled", "1", peer_id)
+    return val == "1"
+
+def set_welcome_enabled(peer_id, enabled):
+    set_setting("welcome_enabled", "1" if enabled else "0", peer_id)
+
+def get_notification_chat():
+    val = get_setting("notification_chat_id", None, None)
+    if val is None or val == '' or val == 'None':
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
+
+def set_notification_chat(peer_id):
+    set_setting("notification_chat_id", str(peer_id), None)
+
+def send_notification(text):
+    chat = get_notification_chat()
+    if chat:
+        send_message(chat, text)
+
 # -------------------- УПРАВЛЕНИЕ ДАТАЦЕНТРОМ И КОПИРОВАНИЕ --------------------
 
 def get_datacenter_peer_id():
     val = get_setting("datacenter_peer_id", None)
-    return int(val) if val else None
+    if val is None or val == '' or val == 'None':
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
 
 def set_datacenter_peer_id(peer_id):
     set_setting("datacenter_peer_id", str(peer_id) if peer_id else "")
@@ -417,10 +697,7 @@ def copy_global_to_audience(target_peer):
     source_conn = get_db_connection(None)
     target_conn = get_db_connection(target_peer)
     try:
-        # Отключаем проверку внешних ключей на время копирования
         target_conn.execute("PRAGMA foreign_keys=OFF")
-        
-        # Копируем таблицы
         tables = ['creative', 'topics', 'test_questions']
         for table in tables:
             target_conn.execute(f"DELETE FROM {table}")
@@ -430,13 +707,10 @@ def copy_global_to_audience(target_peer):
             if not rows:
                 logger.info(f"Таблица {table} пуста, пропускаем")
                 continue
-            # Получаем список колонок (кроме id)
             cur.execute(f"PRAGMA table_info({table})")
             cols = [row['name'] for row in cur.fetchall() if row['name'] != 'id']
             placeholders = ', '.join(['?' for _ in cols])
             insert_sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
-            
-            # Для test_questions сохраняем маппинг старых ID на новые
             if table == 'test_questions':
                 qid_map = {}
                 for row in rows:
@@ -445,7 +719,6 @@ def copy_global_to_audience(target_peer):
                     new_id = cur2.lastrowid
                     qid_map[row['id']] = new_id
                     cur2.close()
-                # После вставки вопросов, копируем test_options
                 cur_opts = source_conn.cursor()
                 cur_opts.execute("SELECT * FROM test_options")
                 opts = cur_opts.fetchall()
@@ -459,25 +732,22 @@ def copy_global_to_audience(target_peer):
                                 (new_qid, opt['option_label'], opt['option_text'])
                             )
                     logger.info(f"Скопировано {len(opts)} вариантов ответов")
-                else:
-                    logger.info("Нет вариантов для копирования")
                 cur_opts.close()
             else:
                 for row in rows:
                     target_conn.execute(insert_sql, [row[col] for col in cols])
             logger.info(f"Скопировано {len(rows)} записей из {table}")
-        
-        # Копируем настройки
         source_cur = source_conn.cursor()
         source_cur.execute("SELECT key, value FROM settings")
         settings = source_cur.fetchall()
         target_conn.execute("DELETE FROM settings")
+        # Исключаем служебные ключи, которые не должны копироваться в аудиторию
+        exclude_keys = {'datacenter_peer_id', 'notification_chat_id'}
         for s in settings:
-            target_conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (s['key'], s['value']))
-        logger.info(f"Скопировано {len(settings)} настроек")
+            if s['key'] not in exclude_keys:
+                target_conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (s['key'], s['value']))
+        logger.info(f"Скопировано {len(settings)} настроек (исключены служебные)")
         source_cur.close()
-        
-        # Включаем проверку внешних ключей обратно
         target_conn.execute("PRAGMA foreign_keys=ON")
         target_conn.commit()
         logger.info("Копирование данных в аудиторию завершено успешно")
@@ -487,7 +757,6 @@ def copy_global_to_audience(target_peer):
     finally:
         source_conn.close()
         target_conn.close()
-
 def copy_datacenter_to_audience(target_peer_id):
     dc = get_datacenter_peer_id()
     if dc is None:
@@ -569,8 +838,6 @@ def get_all_audiences():
 # -------------------- ОЧИСТКА СОСТОЯНИЯ БЕСЕДЫ --------------------
 
 def cleanup_peer_state(peer_id):
-    """Принудительно завершает все процессы, связанные с беседой, и очищает глобальные состояния."""
-    # Очистка активного теста
     if peer_id in active_tests:
         test = active_tests.pop(peer_id)
         if test.get('timer'):
@@ -579,8 +846,6 @@ def cleanup_peer_state(peer_id):
             except:
                 pass
         logger.info(f"Принудительно завершён тест в беседе {peer_id}")
-    
-    # Очистка состояний меню для всех пользователей этой беседы
     keys_to_remove = []
     for key in list(menu_state.keys()):
         if isinstance(key, tuple) and len(key) == 2 and key[0] == peer_id:
@@ -593,14 +858,13 @@ def cleanup_peer_state(peer_id):
 def delete_audience_by_owner(peer_id):
     if is_datacenter(peer_id):
         return False, "Это датацентр, его нельзя удалить этой командой."
-    # Принудительно завершаем все процессы
     cleanup_peer_state(peer_id)
-    # Удаляем файл БД
     delete_audience_db(peer_id)
-    # Удаляем запись из главной БД
     conn = get_db_connection(None)
     try:
         conn.execute("DELETE FROM audiences WHERE peer_id=?", (peer_id,))
+        conn.execute("DELETE FROM audience_students WHERE peer_id=?", (peer_id,))
+        conn.execute("DELETE FROM user_nicknames WHERE peer_id=?", (peer_id,))
         conn.commit()
     finally:
         conn.close()
@@ -658,7 +922,6 @@ def create_datacenter(peer_id, owner_id, request_msg_id=None):
             conn.close()
         logger.info(f"Старый датацентр {old_dc} стал аудиторией")
     init_global_materials()
-
     set_datacenter_peer_id(peer_id)
     conn = get_db_connection(None)
     try:
@@ -675,10 +938,8 @@ def create_audience(peer_id, owner_id, request_msg_id=None):
     dc = get_datacenter_peer_id()
     if dc is None:
         raise Exception("Нет активного датацентра. Сначала создайте датацентр.")
-
     get_db_connection(peer_id)
     copy_global_to_audience(peer_id)
-
     conn = get_db_connection(None)
     try:
         conn.execute(
@@ -703,7 +964,6 @@ def delete_audience(peer_id):
             set_datacenter_peer_id(None)
         logger.info(f"🗑 Датацентр {peer_id} стал обычной аудиторией (данные сохранены в глобальной БД).")
         return
-
     delete_audience_db(peer_id)
     conn = get_db_connection(None)
     try:
@@ -713,24 +973,12 @@ def delete_audience(peer_id):
         conn.close()
     logger.info(f"🗑 Аудитория {peer_id} удалена полностью.")
 
+# ======================== ГЛОБАЛЬНЫЕ СЛОВАРИ ============================
+menu_messages = {}  # peer_id -> conversation_message_id для меню /init
+
 # -------------------- ЗАПРОС ПОДТВЕРЖДЕНИЯ --------------------
 
 def request_audience_confirmation(peer_id):
-    if is_audience_confirmed(peer_id):
-        send_message(peer_id, "✅ Эта беседа уже является аудиторией.")
-        return
-
-    if not bot_is_admin_in_chat(peer_id):
-        send_message(peer_id, "❌ Бот не является администратором этой беседы. Для создания аудитории или датацентра необходимы права администратора.")
-        return
-
-    conn = get_db_connection(None)
-    try:
-        conn.execute("DELETE FROM audiences WHERE peer_id=?", (peer_id,))
-        conn.commit()
-    finally:
-        conn.close()
-
     keyboard = VkKeyboard(inline=True)
     keyboard.add_callback_button(
         label="✅ Создать аудиторию",
@@ -742,15 +990,20 @@ def request_audience_confirmation(peer_id):
         color=VkKeyboardColor.PRIMARY,
         payload={"cmd": "confirm_datacenter"}
     )
+    keyboard.add_line()
+    keyboard.add_callback_button(
+        label="📢 Назначить беседу оповещений",
+        color=VkKeyboardColor.SECONDARY,
+        payload={"cmd": "set_notification_chat"}
+    )
     resp = send_message(peer_id,
-                        "📢 Эта беседа может стать аудиторией обучения.\n"
-                        "Выберите тип создания:\n"
-                        "• «Создать аудиторию» – обычная группа со своей копией базы (требуется наличие датацентра).\n"
-                        "• «Создать датацентр» – центральная база (доступно только владельцу или совладельцу).\n"
-                        "Время на подтверждение: 5 минут.",
-                        keyboard=keyboard)
-    msg_id = resp.get('conversation_message_id') if resp else None
-    set_audience_request(peer_id, owner_id=None, request_msg_id=msg_id)
+                 "📢 Управление беседой:\n\n"
+                 "• «Создать аудиторию» – обычная группа со своей копией базы (требуется наличие датацентра и прав).\n"
+                 "• «Создать датацентр» – центральная база (доступно только владельцу или совладельцу).\n"
+                 "• «Назначить беседу оповещений» – все уведомления будут приходить сюда (только владелец).",
+                 keyboard=keyboard)
+    if resp and resp.get('conversation_message_id'):
+        menu_messages[peer_id] = resp['conversation_message_id']
 
 # -------------------- ПРАВА ДОСТУПА --------------------
 
@@ -1011,13 +1264,6 @@ def add_user_to_chat(peer_id, user_id):
         print(f"⚠️ Ошибка добавления пользователя {user_id}: {e}")
         return False
 
-def get_user_nickname(vk_id):
-    try:
-        user = vk.users.get(user_ids=vk_id)[0]
-        return f"{user['first_name']} {user['last_name']}"
-    except:
-        return f"id{vk_id}"
-
 def delete_message_later(peer_id, msg_id, delay=1):
     if msg_id is None:
         return
@@ -1057,6 +1303,7 @@ def get_main_menu_keyboard(has_full_access=False, can_manage=False, is_datacente
     if can_manage:
         keyboard.add_line()
         keyboard.add_button("🛠 Управление материалами", color=VkKeyboardColor.PRIMARY)
+        keyboard.add_button("👨‍🎓 Студент", color=VkKeyboardColor.PRIMARY)
     if is_datacenter:
         keyboard.add_line()
         keyboard.add_button("⭐ Датацентр", color=VkKeyboardColor.POSITIVE)
@@ -1128,6 +1375,7 @@ def get_manage_main_keyboard():
     keyboard.add_button("❓ Тесты (по одному)", color=VkKeyboardColor.SECONDARY)
     keyboard.add_button("🎨 Творческое", color=VkKeyboardColor.SECONDARY)
     keyboard.add_line()
+    keyboard.add_button("👋 Приветствие", color=VkKeyboardColor.PRIMARY)
     keyboard.add_button("⚙️ Настройки тестирования", color=VkKeyboardColor.PRIMARY)
     keyboard.add_line()
     keyboard.add_button("🏛 Главное меню", color=VkKeyboardColor.PRIMARY)
@@ -1257,6 +1505,34 @@ def get_edit_options_keyboard():
     keyboard.add_button("🔙 Назад", color=VkKeyboardColor.SECONDARY)
     return keyboard.get_keyboard()
 
+def get_welcome_management_keyboard():
+    keyboard = VkKeyboard(one_time=False, inline=False)
+    keyboard.add_button("📝 Изменить текст", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_button("🔕 Отключить", color=VkKeyboardColor.NEGATIVE)
+    keyboard.add_button("🔊 Включить", color=VkKeyboardColor.POSITIVE)
+    keyboard.add_line()
+    keyboard.add_button("🔙 Назад", color=VkKeyboardColor.SECONDARY)
+    return keyboard.get_keyboard()
+
+# -------- Клавиатура для управления студентом ----------
+def get_student_management_keyboard():
+    keyboard = VkKeyboard(one_time=False, inline=False)
+    keyboard.add_button("➕ Добавить студента", color=VkKeyboardColor.POSITIVE)
+    keyboard.add_button("🗑 Удалить студента", color=VkKeyboardColor.NEGATIVE)
+    keyboard.add_line()
+    keyboard.add_button("🎓 Завершить обучение", color=VkKeyboardColor.PRIMARY)
+    keyboard.add_line()
+    keyboard.add_button("🔙 Назад", color=VkKeyboardColor.SECONDARY)
+    return keyboard.get_keyboard()
+
+def get_student_result_keyboard():
+    keyboard = VkKeyboard(one_time=False, inline=False)
+    keyboard.add_button("✅ Успешно (1)", color=VkKeyboardColor.POSITIVE)
+    keyboard.add_button("❌ Не прошёл (2)", color=VkKeyboardColor.NEGATIVE)
+    keyboard.add_line()
+    keyboard.add_button("🔙 Назад", color=VkKeyboardColor.SECONDARY)
+    return keyboard.get_keyboard()
+
 # ======================== ОЧИСТКА ТЕКСТА ============================
 
 def clean_text_from_mentions(text):
@@ -1276,6 +1552,12 @@ def is_panel_command(text):
         "🎨 4 этап (творческое)",
         "🔒 Скрыть панель",
         "🛠 Управление материалами",
+        "👨‍🎓 Студент",
+        "➕ Добавить студента",
+        "🗑 Удалить студента",
+        "🎓 Завершить обучение",
+        "✅ Успешно (1)",
+        "❌ Не прошёл (2)",
         "Конституция",
         "Устав адвокатуры",
         "Уголовный кодекс",
@@ -1329,7 +1611,11 @@ def is_panel_command(text):
         "🗑 Удалить вопрос",
         "➕ Добавить вариант",
         "🗑 Удалить вариант",
-        "✏️ Изменить вариант"
+        "✏️ Изменить вариант",
+        "📝 Изменить текст",
+        "🔕 Отключить",
+        "🔊 Включить",
+        "👋 Приветствие"
     ]
     panel_texts.extend(HODAITSTVA_NAMES.values())
     panel_texts.extend([
@@ -1347,6 +1633,7 @@ menu_state = {}
 menu_state_locks = {}
 active_tests = {}
 test_timers = {}
+notification_messages = {}
 
 def get_menu_state_lock(key):
     if key not in menu_state_locks:
@@ -1365,6 +1652,30 @@ def safe_menu_state_pop(key):
     with get_menu_state_lock(key):
         return menu_state.pop(key, None)
 
+def delete_notification_message(peer_id, cmid):
+    if peer_id in notification_messages and notification_messages[peer_id].get('cmid') == cmid:
+        delete_message(peer_id, cmid, force=True)
+        notification_messages.pop(peer_id, None)
+def schedule_daily_restart():
+    """Планирует перезапуск бота в 5:00 утра по московскому времени."""
+    now = datetime.datetime.now()
+    # Задаём время 5:00 сегодня
+    target = now.replace(hour=5, minute=0, second=0, microsecond=0)
+    # Если 5:00 уже прошло сегодня – переносим на завтра
+    if target <= now:
+        target += datetime.timedelta(days=1)
+    delay = (target - now).total_seconds()
+    logger.info(f"Запланирован перезапуск бота в {target.strftime('%Y-%m-%d %H:%M')} МСК (через {int(delay//3600)}ч {int((delay%3600)//60)}м)")
+
+    def restart_bot():
+        logger.info("🔄 Выполняется плановый перезапуск бота в 5:00 МСК")
+        # Перезапускаем текущий скрипт
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    timer = threading.Timer(delay, restart_bot)
+    timer.daemon = True
+    timer.start()
+    return timer
 # ======================== ОБРАБОТЧИК ГЛАВНОГО МЕНЮ ============================
 
 def handle_main_menu(text, peer_id, sender_id, conversation_message_id, can_manage=False):
@@ -1393,6 +1704,10 @@ def handle_main_menu(text, peer_id, sender_id, conversation_message_id, can_mana
             state_data['state'] = 'stage3_topics'
             safe_menu_state_set(key, state_data)
             send_menu(peer_id, sender_id, "Выберите тему теста:", get_stage3_topics_keyboard())
+        elif state == 'student_menu':
+            state_data['state'] = 'main'
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "🏛 Главное меню:", get_main_menu_keyboard(has_full, can_manage, is_dc))
         else:
             state_data['state'] = 'main'
             safe_menu_state_set(key, state_data)
@@ -1405,34 +1720,53 @@ def handle_main_menu(text, peer_id, sender_id, conversation_message_id, can_mana
         send_message(peer_id, "🔒 Панель скрыта.", keyboard=get_empty_keyboard())
         return True
 
-    if clean_text == "📚 1 этап (собеседование)":
+    # ======= ОБРАБОТКА ЭТАПОВ =======
+    if clean_text in ["📚 1 этап (собеседование)", "📖 2 этап (лекция)", "📝 3 этап (тесты)", "🎨 4 этап (творческое)"]:
         delete_original()
-        st1_text = get_setting("st1_text", None, peer_id)
-        if not st1_text:
-            st1_text = "📝 Текст собеседования не задан."
-        send_long_message(peer_id, st1_text)
-        return True
+        stage_map = {
+            "📚 1 этап (собеседование)": 1,
+            "📖 2 этап (лекция)": 2,
+            "📝 3 этап (тесты)": 3,
+            "🎨 4 этап (творческое)": 4
+        }
+        stage = stage_map[clean_text]
 
-    if clean_text == "📖 2 этап (лекция)":
-        delete_original()
-        st2_text = get_setting("st2_text", None, peer_id)
-        if not st2_text:
-            st2_text = "📚 Текст лекции не задан."
-        send_long_message(peer_id, st2_text)
-        return True
+        if stage == 1:
+            st1_text = get_setting("st1_text", "📝 Текст собеседования не задан.", peer_id)
+            send_long_message(peer_id, st1_text)
+        elif stage == 2:
+            st2_text = get_setting("st2_text", "📚 Текст лекции не задан.", peer_id)
+            send_long_message(peer_id, st2_text)
+        elif stage == 3:
+            state_data['state'] = 'stage3_topics'
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "Выберите тему теста:", get_stage3_topics_keyboard())
+        elif stage == 4:
+            state_data['state'] = 'stage4_types'
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "Выберите тип творческого задания:", get_stage4_types_keyboard())
 
-    if clean_text == "📝 3 этап (тесты)":
-        delete_original()
-        state_data['state'] = 'stage3_topics'
-        safe_menu_state_set(key, state_data)
-        send_menu(peer_id, sender_id, "Выберите тему теста:", get_stage3_topics_keyboard())
-        return True
+        students = get_audience_students(peer_id)
+        if students:
+            keyboard = VkKeyboard(inline=True)
+            keyboard.add_callback_button(
+                "📨 Отправить уведомление",
+                color=VkKeyboardColor.POSITIVE,
+                payload={"cmd": "notify_stage", "stage": stage}
+            )
+            keyboard.add_callback_button(
+                "❌ Пропустить",
+                color=VkKeyboardColor.NEGATIVE,
+                payload={"cmd": "skip_notification", "stage": stage}
+            )
+            resp = send_message(peer_id, f"📤 В аудитории есть студенты. Отправить уведомление о начале этапа {stage} в коллегию?", keyboard=keyboard)
+            if resp and resp.get('conversation_message_id'):
+                cmid = resp['conversation_message_id']
+                timer = threading.Timer(60.0, lambda: delete_notification_message(peer_id, cmid))
+                timer.daemon = True
+                timer.start()
+                notification_messages[peer_id] = {'cmid': cmid, 'timer': timer}
 
-    if clean_text == "🎨 4 этап (творческое)":
-        delete_original()
-        state_data['state'] = 'stage4_types'
-        safe_menu_state_set(key, state_data)
-        send_menu(peer_id, sender_id, "Выберите тип творческого задания:", get_stage4_types_keyboard())
         return True
 
     if clean_text == "🛠 Управление материалами" and can_manage:
@@ -1446,7 +1780,116 @@ def handle_main_menu(text, peer_id, sender_id, conversation_message_id, can_mana
         send_menu(peer_id, sender_id, "🛠 Панель управления материалами:", get_manage_main_keyboard())
         return True
 
-    # ---------- ВЫБОР ТЕМЫ (3 ЭТАП) ----------
+    # ====== УПРАВЛЕНИЕ СТУДЕНТОМ ======
+    if clean_text == "👨‍🎓 Студент" and can_manage:
+        delete_original()
+        state_data['state'] = 'student_menu'
+        safe_menu_state_set(key, state_data)
+        show_student_menu(peer_id, sender_id, key)
+        return True
+
+    if state == 'student_menu':
+        if clean_text == "➕ Добавить студента":
+            state_data['state'] = 'student_add_wait'
+            safe_menu_state_set(key, state_data)
+            send_message(peer_id, "👤 Отправьте @упоминание пользователя, которого хотите добавить как студента.\nИли нажмите «🔙 Назад» для отмены.")
+            return True
+        elif clean_text == "🗑 Удалить студента":
+            student = get_audience_students(peer_id)
+            if not student:
+                send_message(peer_id, "❌ В аудитории нет студентов для удаления.")
+                return True
+            user_id = student[0]['user_id']
+            remove_student(peer_id, user_id)
+            send_message(peer_id, f"✅ Студент {get_user_mention(user_id, peer_id)} удалён.")
+            show_student_menu(peer_id, sender_id, key)
+            return True
+        elif clean_text == "🎓 Завершить обучение":
+            student = get_audience_students(peer_id)
+            if not student:
+                send_message(peer_id, "❌ В аудитории нет студентов для завершения.")
+                return True
+            state_data['state'] = 'student_result_wait'
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "Выберите результат обучения:", get_student_result_keyboard())
+            return True
+        else:
+            return True
+
+    if state == 'student_add_wait':
+        if clean_text == "🔙 Назад":
+            state_data['state'] = 'student_menu'
+            safe_menu_state_set(key, state_data)
+            show_student_menu(peer_id, sender_id, key)
+            return True
+        match = re.search(r'\[id(\d+)\|', text)
+        if not match:
+            send_message(peer_id, "⚠️ Не удалось распознать пользователя. Используйте @упоминание.")
+            return True
+        user_id = match.group(1)
+        existing = get_student(peer_id, user_id)
+        if existing:
+            send_message(peer_id, f"⚠️ Пользователь {get_user_mention(user_id, peer_id)} уже является студентом.")
+            return True
+        current = get_audience_students(peer_id)
+        if current:
+            send_message(peer_id, f"⚠️ В аудитории уже есть студент: {get_user_mention(current[0]['user_id'], peer_id)}. Сначала удалите его.")
+            return True
+        add_student(peer_id, user_id, sender_id)
+        send_message(peer_id, f"✅ Студент {get_user_mention(user_id, peer_id)} добавлен.")
+        state_data['state'] = 'student_menu'
+        safe_menu_state_set(key, state_data)
+        show_student_menu(peer_id, sender_id, key)
+        return True
+
+    if state == 'student_result_wait':
+        if clean_text == "🔙 Назад":
+            state_data['state'] = 'student_menu'
+            safe_menu_state_set(key, state_data)
+            show_student_menu(peer_id, sender_id, key)
+            return True
+        result = None
+        if clean_text == "✅ Успешно (1)":
+            result = "1"
+        elif clean_text == "❌ Не прошёл (2)":
+            result = "2"
+        else:
+            send_message(peer_id, "⚠️ Выберите один из вариантов на клавиатуре.")
+            return True
+
+        student = get_audience_students(peer_id)
+        if not student:
+            send_message(peer_id, "❌ Студент не найден.")
+            state_data['state'] = 'student_menu'
+            safe_menu_state_set(key, state_data)
+            show_student_menu(peer_id, sender_id, key)
+            return True
+        user_id = student[0]['user_id']
+        chat_name = get_chat_name(peer_id) or f"Беседа {peer_id}"
+        owner_id = get_audience_owner(peer_id)
+        owner_mention = get_user_mention(owner_id, peer_id) if owner_id else "Неизвестно"
+        student_mention = get_user_mention(user_id, peer_id)
+        result_text = "✅ прошёл" if result == "1" else "❌ не прошёл"
+        notif_msg = f"📢 Аудитория: {chat_name}\nРектор: {owner_mention}\nСтудент: {student_mention} {result_text} университет."
+        send_notification(notif_msg)
+
+        finish_student(peer_id, user_id, result)
+        remove_student(peer_id, user_id)
+
+        if result == "1":
+            text = read_text_file("graduation.txt")
+            if text is None:
+                text = "🎉 Поздравляем! Вы успешно окончили университет!"
+            send_message(peer_id, text)
+        else:
+            send_message(peer_id, "❌ Студент не прошёл университет.")
+        kick_from_chat(peer_id, int(user_id))
+
+        state_data['state'] = 'student_menu'
+        safe_menu_state_set(key, state_data)
+        show_student_menu(peer_id, sender_id, key)
+        return True
+
     if state == 'stage3_topics':
         topics_map = {
             "Конституция": "Конституция",
@@ -1463,7 +1906,6 @@ def handle_main_menu(text, peer_id, sender_id, conversation_message_id, can_mana
             send_menu(peer_id, sender_id, f"Выберите вариант для {clean_text}:", get_stage3_variants_keyboard(topic))
             return True
 
-    # ---------- ВЫБОР ВАРИАНТА ТЕСТА ----------
     if state.startswith('stage3_variants_'):
         topic = state.replace('stage3_variants_', '')
         display_topic = topic.replace('_', ' ')
@@ -1477,7 +1919,6 @@ def handle_main_menu(text, peer_id, sender_id, conversation_message_id, can_mana
                     send_message(peer_id, f"❓ Для {display_topic} вариант {v} нет вопросов. Добавьте их в управлении материалами.")
                 return True
 
-    # ---------- ВЫБОР ТИПА (4 ЭТАП) ----------
     if state == 'stage4_types':
         type_map = {
             "Ходатайства": "Ходатайства",
@@ -1492,7 +1933,6 @@ def handle_main_menu(text, peer_id, sender_id, conversation_message_id, can_mana
             send_menu(peer_id, sender_id, f"Выберите вариант для {clean_text}:", get_stage4_variants_keyboard(ctype))
             return True
 
-    # ---------- ВЫБОР ВАРИАНТА ТВОРЧЕСКОГО ----------
     if state.startswith('stage4_variants_'):
         ctype = state.replace('stage4_variants_', '')
         display_type = ctype.replace('_', ' ')
@@ -1555,7 +1995,21 @@ def handle_main_menu(text, peer_id, sender_id, conversation_message_id, can_mana
 
     return False
 
-# ======================== ФУНКЦИИ ТЕСТИРОВАНИЯ (общие для всей беседы) ============================
+# ===== ФУНКЦИЯ ДЛЯ ОТОБРАЖЕНИЯ МЕНЮ СТУДЕНТА =====
+def show_student_menu(peer_id, sender_id, key):
+    students = get_audience_students(peer_id)
+    if students:
+        student_id = students[0]['user_id']
+        mention = get_user_mention(student_id, peer_id)
+        added_by = get_user_mention(students[0]['added_by'], peer_id)
+        added_at = time.strftime("%d.%m.%Y %H:%M", time.localtime(students[0]['added_at']))
+        info = f"👨‍🎓 Текущий студент: {mention}\nДобавлен: {added_by} {added_at}\n"
+    else:
+        info = "👨‍🎓 В аудитории нет студентов.\n"
+    msg = info + "\nВыберите действие:"
+    send_menu(peer_id, sender_id, msg, get_student_management_keyboard())
+
+# ======================== ФУНКЦИИ ТЕСТИРОВАНИЯ ============================
 
 def start_one_by_one_test(peer_id, topic, variant, sender_id):
     if peer_id in active_tests:
@@ -1603,7 +2057,6 @@ def begin_test(peer_id, cmid):
     test = active_tests.get(peer_id)
     if not test or test.get('started', False):
         return
-
     test['cmid'] = cmid
     test['started'] = True
     send_next_question(peer_id)
@@ -1612,7 +2065,6 @@ def cancel_test(peer_id, cmid):
     test = active_tests.pop(peer_id, None)
     if not test:
         return
-
     if cmid:
         edit_message(peer_id, cmid, "❌ Тест отменён.", keyboard=get_empty_keyboard())
 
@@ -1620,19 +2072,15 @@ def send_next_question(peer_id):
     test = active_tests.get(peer_id)
     if not test or test.get('finished', False):
         return
-
     if not test.get('started', False):
         return
-
     if test.get('paused', False):
         return
-
     idx = test['current_index']
     questions = test['questions']
     if idx >= len(questions):
         finish_test(peer_id, success=True)
         return
-
     q = questions[idx]
     options = q['options']
     if not options:
@@ -1648,23 +2096,19 @@ def send_next_question(peer_id):
         if not check_fail(peer_id):
             send_next_question(peer_id)
         return
-
     question_text = f"❓ {idx+1}. {q['question_text']}"
     option_labels = [opt['option_label'] for opt in options]
     option_texts = [opt['option_text'] for opt in options]
     for label, text in zip(option_labels, option_texts):
-        question_text += f"\n{label} {text}"
-
+        question_text += f"\n{label}). {text}"
     keyboard = get_test_question_keyboard(option_texts, option_labels)
     cmid = test.get('cmid')
-
     if cmid:
         edit_message(peer_id, cmid, question_text, keyboard=keyboard)
     else:
         resp = send_message(peer_id, question_text, keyboard=keyboard)
         if resp and resp.get('conversation_message_id'):
             test['cmid'] = resp['conversation_message_id']
-
     time_limit = get_test_time_limit(peer_id)
     if test.get('timer'):
         test['timer'].cancel()
@@ -1677,13 +2121,10 @@ def pause_test(peer_id, cmid):
     test = active_tests.get(peer_id)
     if not test or test.get('finished', False):
         return
-
     if test.get('timer'):
         test['timer'].cancel()
         test['timer'] = None
-
     test['paused'] = True
-
     text = "⏸ Тест приостановлен. Выберите действие:"
     keyboard = get_test_pause_keyboard()
     if cmid:
@@ -1695,10 +2136,8 @@ def resume_test(peer_id, cmid):
     test = active_tests.get(peer_id)
     if not test or test.get('finished', False):
         return
-
     if not test.get('paused', False):
         return
-
     test['paused'] = False
     send_next_question(peer_id)
 
@@ -1706,18 +2145,15 @@ def end_test_early(peer_id, cmid):
     test = active_tests.get(peer_id)
     if not test or test.get('finished', False):
         return
-
     if test.get('timer'):
         test['timer'].cancel()
         test['timer'] = None
-
     finish_test(peer_id, success=False, reason='user_cancelled')
 
 def on_test_timeout(peer_id):
     test = active_tests.get(peer_id)
     if not test or test.get('finished', False):
         return
-
     q = test['questions'][test['current_index']]
     test['results'].append(False)
     test['answers'].append({
@@ -1728,10 +2164,8 @@ def on_test_timeout(peer_id):
     })
     test['errors'] += 1
     test['current_index'] += 1
-
     if check_fail(peer_id):
         return
-
     cmid = test.get('cmid')
     if cmid:
         edit_message(peer_id, cmid, "⏰ Время вышло! Засчитано как ошибка.", keyboard=get_empty_keyboard())
@@ -1763,42 +2197,42 @@ def finish_test(peer_id, success, reason=None):
     test = active_tests.pop(peer_id, None)
     if not test:
         return
-
     if test.get('timer'):
         test['timer'].cancel()
-
     total = test['total']
     results = test['results']
     correct = sum(results)
     errors = test['errors']
-
     report_lines = []
     for i, res in enumerate(results, 1):
         report_lines.append(f"{i}. {'+' if res else '-'}")
     report = "\n".join(report_lines)
-
     if reason == 'user_cancelled':
         msg = f"⏹ Тест завершён досрочно.\nПравильных: {correct}/{total}\nОшибок: {errors}\n\n{report}"
     elif success:
         msg = f"✅ Тест пройден!\nПравильных: {correct}/{total}\nОшибок: {errors}\n\n{report}"
     else:
         msg = f"❌ Тест провален! Превышен порог ошибок ({get_test_fail_threshold(peer_id)}).\nПравильных: {correct}/{total}\nОшибок: {errors}\n\n{report}"
-
     cmid = test.get('cmid')
     if cmid:
         edit_message(peer_id, cmid, msg, keyboard=get_stage3_topics_keyboard())
     else:
         send_message(peer_id, msg, keyboard=get_stage3_topics_keyboard())
-
     initiator = test.get('initiator')
     if initiator:
         key = (peer_id, initiator)
         safe_menu_state_set(key, {'mode': 'main', 'state': 'stage3_topics'})
-
+    
     datacenter = get_datacenter_peer_id()
     if datacenter and datacenter != peer_id:
         audience_name = get_chat_name(peer_id) or f"Беседа {peer_id}"
-        header = f"📝 ДЕТАЛЬНЫЙ ОТЧЁТ по тесту от аудитории: {audience_name}\nТема: {test['topic']} (вариант {test['variant']})\n\n"
+        students = get_audience_students(peer_id)
+        student_info = ""
+        if students:
+            student_id = students[0]['user_id']
+            student_mention = get_user_mention(student_id, peer_id)
+            student_info = f"Студент: {student_mention}\n"
+        header = f"📝 ДЕТАЛЬНЫЙ ОТЧЁТ по тесту от аудитории: {audience_name}\n{student_info}Тема: {test['topic']} (вариант {test['variant']})\n\n"
         detail_lines = []
         for i, ans in enumerate(test.get('answers', []), 1):
             status = "✅" if ans.get('correct', False) else "❌"
@@ -1816,22 +2250,18 @@ def handle_test_answer_callback(event):
     test = active_tests.get(peer_id)
     if not test or test.get('finished', False):
         return
-
     if test.get('timer'):
         test['timer'].cancel()
         test['timer'] = None
-
     payload = event.object.payload
     if not payload or 'index' not in payload:
         return
     chosen_index = payload['index']
-
     q = test['questions'][test['current_index']]
     options = q.get('options', [])
     correct_index = q.get('correct_option_index', 0)
     correct_text = options[correct_index]['option_text'] if options else 'Нет вариантов'
     chosen_text = options[chosen_index]['option_text'] if options and chosen_index < len(options) else 'Неизвестно'
-
     correct = (chosen_index == correct_index)
     test['results'].append(correct)
     test['answers'].append({
@@ -1842,12 +2272,9 @@ def handle_test_answer_callback(event):
     })
     if not correct:
         test['errors'] += 1
-
     test['current_index'] += 1
-
     if check_fail(peer_id):
         return
-
     cmid = test.get('cmid')
     if cmid:
         edit_message(peer_id, cmid, "⏳ Следующий вопрос...", keyboard=get_empty_keyboard())
@@ -1870,19 +2297,16 @@ def handle_command(text, peer_id, sender_id):
     args = parts[1:] if len(parts) > 1 else []
 
     if peer_id >= 2000000000 and not is_audience_confirmed(peer_id):
-        if cmd not in ['/init', '/help']:
+        if cmd not in ['/init', '/help', '/setnotifchat']:
             send_message(peer_id, "❌ Беседа не активирована. Используйте /init для активации.")
             return
 
-    owner_only_commands = ["/addcoowner", "/removecoowner", "/listcoowners", "/listaudiences", "/deleteaudience", "/settext", "/settime", "/setthreshold"]
+    owner_only_commands = ["/addcoowner", "/removecoowner", "/listcoowners", "/listaudiences", "/deleteaudience", "/settext", "/settime", "/setthreshold", "/setnotifchat"]
     if cmd in owner_only_commands and not is_owner(sender_id):
         send_message(peer_id, "❌ Эта команда доступна только владельцу.")
         return
 
     if cmd == "/init":
-        if not can_create_audience(sender_id):
-            send_message(peer_id, "❌ У вас нет прав на создание аудиторий. Обратитесь к владельцу.")
-            return
         if peer_id < 2000000000:
             send_message(peer_id, "❌ /init работает только в беседах.")
             return
@@ -1893,7 +2317,86 @@ def handle_command(text, peer_id, sender_id):
         send_message(peer_id, "❌ У вас нет прав для использования бота.")
         return
 
+    # ============ УНИВЕРСАЛЬНАЯ КОМАНДА /nick ============
+    if cmd == "/nick":
+        if len(args) < 1:
+            send_message(peer_id, "⚠️ Использование: /nick [@user] <ник>\nЕсли @user указан, устанавливает ник ему (только для владельца/совладельца или владельца аудитории), иначе – себе.")
+            return
+
+        # Определяем, есть ли упоминание в виде [id...] или @имя
+        mention = None
+        nickname_parts = []
+        for i, arg in enumerate(args):
+            if re.search(r'\[id\d+\|', arg) or arg.startswith('@'):
+                mention = arg
+                nickname_parts = args[i+1:]
+                break
+
+        if mention:
+            # Устанавливаем ник другому пользователю
+            if not (is_full_access(sender_id) or can_manage_materials(sender_id, peer_id)):
+                send_message(peer_id, "❌ Установка ника другому пользователю доступна только владельцу/совладельцу бота или владельцу аудитории.")
+                return
+
+            user_id = None
+            # 1) Пробуем стандартную ссылку [id...]
+            match = re.search(r'\[id(\d+)\|', mention)
+            if match:
+                user_id = match.group(1)
+            else:
+                # 2) Ищем по @имени через участников беседы
+                name = mention[1:].lower()  # убираем @
+                try:
+                    members = vk.messages.getConversationMembers(peer_id=peer_id)
+                    for item in members.get('items', []):
+                        member_id = item.get('member_id')
+                        if member_id and member_id > 0:
+                            try:
+                                user_info = vk.users.get(user_ids=member_id)[0]
+                                full_name = f"{user_info['first_name']} {user_info['last_name']}".lower()
+                                screen_name = user_info.get('screen_name', '').lower()
+                                if name in full_name or name == screen_name:
+                                    user_id = str(member_id)
+                                    break
+                            except:
+                                continue
+                except Exception as e:
+                    logger.error(f"Ошибка поиска участников: {e}")
+
+            if not user_id:
+                send_message(peer_id, "⚠️ Не удалось распознать пользователя. Используйте @упоминание из списка (кликните по имени) или проверьте имя.")
+                return
+
+            if not nickname_parts:
+                send_message(peer_id, "⚠️ Укажите ник после @упоминания.")
+                return
+
+            nickname = ' '.join(nickname_parts)
+            set_user_nickname(user_id, nickname, peer_id, sender_id)
+            send_message(peer_id, f"✅ Пользователю {get_user_mention(user_id, peer_id)} установлен ник: {nickname}")
+        else:
+            # Устанавливаем ник себе
+            nickname = ' '.join(args)
+            set_user_nickname(sender_id, nickname, peer_id, sender_id)
+            send_message(peer_id, f"✅ Ваш ник в этой аудитории установлен: {nickname}")
+        return
+
+    if cmd == "/setnotifchat":
+        if not is_owner(sender_id):
+            send_message(peer_id, "❌ Команда доступна только владельцу бота.")
+            return
+        if peer_id < 2000000000:
+            send_message(peer_id, "❌ Команда работает только в беседах.")
+            return
+        set_notification_chat(peer_id)
+        send_message(peer_id, "✅ Эта беседа назначена как беседа оповещений (коллегия).")
+        return
+
+    # ============ СТАНДАРТНЫЕ КОМАНДЫ ============
     if cmd == "/menu":
+        if not can_manage_materials(sender_id, peer_id):
+            send_message(peer_id, "❌ У вас нет прав на управление этой аудиторией.")
+            return
         key = (peer_id, sender_id)
         if key in menu_state:
             safe_menu_state_pop(key)
@@ -1905,6 +2408,9 @@ def handle_command(text, peer_id, sender_id):
         return
 
     if cmd == "/panel":
+        if not can_manage_materials(sender_id, peer_id):
+            send_message(peer_id, "❌ У вас нет прав на управление этой аудиторией.")
+            return
         key = (peer_id, sender_id)
         if key in menu_state:
             safe_menu_state_pop(key)
@@ -1935,58 +2441,71 @@ def handle_command(text, peer_id, sender_id):
         send_message(peer_id, "✅ Меню сброшено.")
         return
 
-    # ==================== НОВАЯ КОМАНДА /restart ====================
     if cmd == "/restart":
-        if not is_full_access(sender_id):
-            send_message(peer_id, "❌ Команда доступна только владельцу или совладельцу.")
+        if not is_full_access(sender_id) and not can_manage_materials(sender_id, peer_id):
+            send_message(peer_id, "❌ Команда доступна только владельцу/совладельцу бота или владельцу аудитории.")
             return
         send_message(peer_id, "🔄 Перезапуск бота...")
         logger.info(f"Бот перезапущен пользователем {sender_id} из беседы {peer_id}")
-        # Завершаем процесс с кодом 0, менеджер процессов перезапустит
+        try:
+            with open(RESTART_PEER_FILE, 'w') as f:
+                f.write(str(peer_id))
+        except:
+            pass
         sys.exit(0)
-
+        
     if cmd == "/help":
         help_text = (
             "⚙️ УПРАВЛЕНИЕ БОТОМ\n\n"
-            "📄 ТЕСТЫ И МАТЕРИАЛЫ\n"
-            "/st 1 — собеседование\n"
-            "/st 2 — лекция\n"
-            "/st 3 <тема> <вариант> — тест (по одному)\n"
-            "/st 4 <тип> <вариант> — творческое\n\n"
-            "🔒 ПРАВА ДОСТУПА\n"
-            "/allow @user — выдать доступ на создание аудиторий (только владелец)\n"
-            "/disallow @user — забрать доступ\n"
-            "/listallowed — список администраторов (могут создавать аудитории)\n"
-            "/addcoowner @user — добавить совладельца (полный доступ, только владелец)\n"
+            "📌 ОСНОВНЫЕ КОМАНДЫ\n"
+            "/menu — открыть главное меню\n"
+            "/manage — открыть панель управления материалами (доступно владельцу аудитории)\n"
+            "/clearmenu — сбросить состояние меню\n"
+            "/mypeer — показать ID текущей беседы\n"
+            "/help — показать эту справку\n\n"
+            "🔒 ПРАВА ДОСТУПА (только владелец бота)\n"
+            "/allow @user — выдать право на создание аудиторий\n"
+            "/disallow @user — забрать право\n"
+            "/listallowed — список пользователей с правом создания аудиторий\n"
+            "/addcoowner @user — добавить совладельца (полный доступ)\n"
             "/removecoowner @user — убрать совладельца\n"
-            "/listcoowners — список совладельцев\n\n"
-            "📝 ШАБЛОНЫ ТЕКСТОВ (только владелец/совладелец)\n"
-            "/settext st1|st2|st3|st4|graduation <текст>\n\n"
-            "🔧 НАСТРОЙКИ ТЕСТИРОВАНИЯ (по одному)\n"
+            "/listcoowners — список совладельцев\n"
+            "/setnotifchat — назначить текущую беседу как беседу оповещений (коллегия)\n\n"
+            "📝 ШАБЛОНЫ ТЕКСТОВ (только владелец бота)\n"
+            "/settext st1|st2|st3|st4|graduation <текст> — установить текст для этапов\n"
+            "   st1 — собеседование, st2 — лекция, st3 — тесты, st4 — творческое, graduation — поздравление\n\n"
+            "🔧 НАСТРОЙКИ ТЕСТИРОВАНИЯ (по одному) (только владелец бота)\n"
             "/settime <сек> — время на вопрос\n"
             "/setthreshold <число> — порог ошибок\n\n"
-            "🔧 ДРУГОЕ\n"
-            "/menu — открыть главное меню\n"
-            "/clearmenu — сбросить состояние меню\n"
-            "/mypeer — показать ID беседы\n"
-            "/addto @user — добавить в беседу\n"
-            "/end @user 1|2 — завершить обучение\n\n"
-            "🏛 АУДИТОРИИ\n"
-            "/init — запросить подтверждение аудитории (только для тех, у кого есть право создавать)\n"
-            "/sync — синхронизировать с датацентром (копировать данные)\n"
-            "/setowner @user — сменить владельца аудитории\n"
-            "/listaudiences — список всех аудиторий (названия, владелец, последняя активность)\n"
-            "/deleteaudience <peer_id> — удалить аудиторию (только владелец)\n\n"
-            "🔄 /restart — перезапустить бота (только владелец/совладелец)"
+            "👥 УПРАВЛЕНИЕ АУДИТОРИЯМИ\n"
+            "/init — запросить подтверждение аудитории (доступно тем, у кого есть право создавать)\n"
+            "/sync — синхронизировать данные с датацентром (владелец аудитории)\n"
+            "/setowner @user — сменить владельца аудитории (владелец аудитории)\n"
+            "/listaudiences — список всех аудиторий (только владелец бота)\n"
+            "/deleteaudience <peer_id> — удалить аудиторию (только владелец бота)\n\n"
+            "👤 УПРАВЛЕНИЕ НИКАМИ\n"
+            "/nick [@user] <ник> — установить ник (если @user указан, то ему, иначе себе; для установки другому нужны права владельца/совладельца или владельца аудитории)\n\n"
+            "👨‍🎓 УПРАВЛЕНИЕ СТУДЕНТОМ (владелец аудитории)\n"
+            "Используйте кнопку «👨‍🎓 Студент» в главном меню.\n"
+            "Там можно добавить, удалить студента или завершить его обучение.\n\n"
+            "🔄 ПРОЧЕЕ\n"
+            "/restart — перезапустить бота (только владелец/совладелец)\n"
+            "/addto @user — добавить пользователя в беседу (требуются права бота)"
         )
         send_message(peer_id, help_text)
         return
 
     if cmd == "/mypeer":
+        if not can_manage_materials(sender_id, peer_id):
+            send_message(peer_id, "❌ У вас нет прав на использование этой команды в данной беседе.")
+            return
         send_message(peer_id, f"📌 Peer ID: {peer_id}")
         return
 
     if cmd == "/addto":
+        if not can_manage_materials(sender_id, peer_id):
+            send_message(peer_id, "❌ У вас нет прав на добавление пользователей в эту беседу.")
+            return
         if not args:
             send_message(peer_id, "⚠️ /addto @user")
             return
@@ -1997,7 +2516,7 @@ def handle_command(text, peer_id, sender_id):
             return
         user_id = match.group(1)
         if add_user_to_chat(peer_id, int(user_id)):
-            send_message(peer_id, f"✅ Пользователь {get_user_nickname(user_id)} добавлен в беседу.")
+            send_message(peer_id, f"✅ Пользователь {get_user_mention(user_id, peer_id)} добавлен в беседу.")
         else:
             send_message(peer_id, "❌ Не удалось добавить пользователя. Проверьте права бота.")
         return
@@ -2016,7 +2535,7 @@ def handle_command(text, peer_id, sender_id):
             return
         user_id = match.group(1)
         add_allowed_user(user_id, sender_id)
-        send_message(peer_id, f"✅ Права на создание аудиторий выданы пользователю {get_user_nickname(user_id)}.")
+        send_message(peer_id, f"✅ Права на создание аудиторий выданы пользователю {get_user_mention(user_id, peer_id)}.")
         return
 
     if cmd == "/disallow":
@@ -2033,7 +2552,7 @@ def handle_command(text, peer_id, sender_id):
             return
         user_id = match.group(1)
         remove_allowed_user(user_id)
-        send_message(peer_id, f"✅ Права на создание аудиторий отозваны у {get_user_nickname(user_id)}.")
+        send_message(peer_id, f"✅ Права на создание аудиторий отозваны у {get_user_mention(user_id, peer_id)}.")
         return
 
     if cmd == "/listallowed":
@@ -2046,10 +2565,10 @@ def handle_command(text, peer_id, sender_id):
             return
         text = "📋 СПИСОК АДМИНИСТРАТОРОВ (могут создавать аудитории)\n\n"
         for row in rows:
-            nick = get_user_nickname(row['user_id'])
-            added_by = get_user_nickname(row['added_by'])
+            nick = get_user_mention(row['user_id'], peer_id)
+            added_by = get_user_mention(row['added_by'], peer_id)
             date = time.strftime("%d.%m.%Y", time.localtime(row['added_at']))
-            text += f"• {nick} (ID {row['user_id']}) — добавлен {added_by} {date}\n"
+            text += f"• {nick} — добавлен {added_by} {date}\n"
         send_message(peer_id, text)
         return
 
@@ -2067,7 +2586,7 @@ def handle_command(text, peer_id, sender_id):
             return
         user_id = match.group(1)
         add_co_owner(user_id, sender_id)
-        send_message(peer_id, f"✅ Пользователь {get_user_nickname(user_id)} назначен совладельцем.")
+        send_message(peer_id, f"✅ Пользователь {get_user_mention(user_id, peer_id)} назначен совладельцем.")
         return
 
     if cmd == "/removecoowner":
@@ -2084,7 +2603,7 @@ def handle_command(text, peer_id, sender_id):
             return
         user_id = match.group(1)
         remove_co_owner(user_id)
-        send_message(peer_id, f"✅ Пользователь {get_user_nickname(user_id)} больше не совладелец.")
+        send_message(peer_id, f"✅ Пользователь {get_user_mention(user_id, peer_id)} больше не совладелец.")
         return
 
     if cmd == "/listcoowners":
@@ -2094,10 +2613,10 @@ def handle_command(text, peer_id, sender_id):
             return
         text = "📋 СПИСОК СОВЛАДЕЛЬЦЕВ (полный доступ)\n\n"
         for row in rows:
-            nick = get_user_nickname(row['user_id'])
-            added_by = get_user_nickname(row['added_by'])
+            nick = get_user_mention(row['user_id'], peer_id)
+            added_by = get_user_mention(row['added_by'], peer_id)
             date = time.strftime("%d.%m.%Y", time.localtime(row['added_at']))
-            text += f"• {nick} (ID {row['user_id']}) — добавлен {added_by} {date}\n"
+            text += f"• {nick} — добавлен {added_by} {date}\n"
         send_message(peer_id, text)
         return
 
@@ -2114,10 +2633,12 @@ def handle_command(text, peer_id, sender_id):
             peer = row['peer_id']
             owner = row['owner_id']
             last_activity = row['last_activity']
-            owner_name = get_user_nickname(owner) if owner else "Неизвестно"
+            owner_mention = get_user_mention(owner, peer) if owner else "Неизвестно"
             chat_name = get_chat_name(peer) or f"Беседа {peer}"
             last_time = time.strftime("%d.%m.%Y %H:%M", time.localtime(last_activity))
-            text += f"• {chat_name}\n   ID: {peer}\n   Владелец: {owner_name}\n   Последняя активность: {last_time}\n\n"
+            students = get_audience_students(peer)
+            students_text = ", ".join([get_user_mention(s['user_id'], peer) for s in students]) if students else "нет"
+            text += f"• {chat_name}\n   ID: {peer}\n   Владелец: {owner_mention}\n   Студенты: {students_text}\n   Последняя активность: {last_time}\n\n"
         send_message(peer_id, text)
         return
 
@@ -2184,31 +2705,7 @@ def handle_command(text, peer_id, sender_id):
             conn.commit()
         finally:
             conn.close()
-        send_message(peer_id, f"✅ Владельцем аудитории теперь является {get_user_nickname(new_owner)}.")
-        return
-
-    if cmd == "/end":
-        if len(args) < 2:
-            send_message(peer_id, "⚠️ /end @user 1|2")
-            return
-        mention = args[0]
-        match = re.search(r'\[id(\d+)\|', mention)
-        if not match:
-            send_message(peer_id, "⚠️ Не удалось распознать пользователя.")
-            return
-        user_id = match.group(1)
-        result = args[1]
-        if result not in ("1", "2"):
-            send_message(peer_id, "⚠️ Результат: 1 — успешно, 2 — не прошёл")
-            return
-        if result == "1":
-            text = read_text_file("graduation.txt")
-            if text is None:
-                text = "🎉 Поздравляем! Вы успешно окончили университет!"
-            send_message(peer_id, text)
-        else:
-            send_message(peer_id, "❌ Студент не прошёл университет.")
-        kick_from_chat(peer_id, int(user_id))
+        send_message(peer_id, f"✅ Владельцем аудитории теперь является {get_user_mention(new_owner, peer_id)}.")
         return
 
     if cmd == "/settext":
@@ -2229,13 +2726,19 @@ def handle_command(text, peer_id, sender_id):
             send_message(peer_id, "⚠️ /settime <секунды>")
             return
         try:
-            seconds = int(args[0])
+            # Очищаем строку от лишних пробелов и невидимых символов
+            raw = args[0].strip()
+            seconds = int(raw)
             if seconds < 1:
                 raise ValueError
             set_test_time_limit(peer_id, seconds)
             send_message(peer_id, f"✅ Время на вопрос установлено: {seconds} сек.")
-        except:
-            send_message(peer_id, "❌ Введите положительное число.")
+        except ValueError as e:
+            logger.error(f"Ошибка /settime: args={args}, raw='{raw}', error={e}")
+            send_message(peer_id, "❌ Введите положительное целое число (например, 30).")
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка /settime: {e}")
+            send_message(peer_id, "❌ Произошла ошибка. Попробуйте снова.")
         return
 
     if cmd == "/setthreshold":
@@ -2243,13 +2746,18 @@ def handle_command(text, peer_id, sender_id):
             send_message(peer_id, "⚠️ /setthreshold <число>")
             return
         try:
-            threshold = int(args[0])
+            raw = args[0].strip()
+            threshold = int(raw)
             if threshold < 0:
                 raise ValueError
             set_test_fail_threshold(peer_id, threshold)
             send_message(peer_id, f"✅ Порог ошибок установлен: {threshold}.")
-        except:
-            send_message(peer_id, "❌ Введите неотрицательное число.")
+        except ValueError as e:
+            logger.error(f"Ошибка /setthreshold: args={args}, raw='{raw}', error={e}")
+            send_message(peer_id, "❌ Введите неотрицательное целое число (например, 5).")
+        except Exception as e:
+            logger.error(f"Неизвестная ошибка /setthreshold: {e}")
+            send_message(peer_id, "❌ Произошла ошибка. Попробуйте снова.")
         return
 
     send_message(peer_id, "⚠️ Неизвестная команда. Введите /help для списка.")
@@ -2269,9 +2777,65 @@ def handle_manage_message(text, peer_id, sender_id, conversation_message_id):
         if conversation_message_id:
             delete_message(peer_id, conversation_message_id)
 
-    # ----- АККУМУЛЯЦИЯ ТЕКСТА -----
+    # ===== ДОБАВЛЕНО ДЛЯ ПРИВЕТСТВИЯ: ОБРАБОТКА СОСТОЯНИЙ =====
+    if current_state == 'wait_welcome_text':
+        if clean_text == "💾 Сохранить":
+            final_text = state_data.get('buffer', '').strip()
+            set_welcome_message(peer_id, final_text)
+            state_data['state'] = 'manage_welcome'
+            safe_menu_state_set(key, state_data)
+            send_message(peer_id, f"✅ Приветствие сохранено!\n\n{final_text if final_text else '(пусто)'}")
+            delete_message_later(peer_id, conversation_message_id)
+            show_welcome_status(peer_id, sender_id, key)
+            return True
+        elif clean_text == "🔙 Назад":
+            state_data['state'] = 'manage_welcome'
+            safe_menu_state_set(key, state_data)
+            send_message(peer_id, "❌ Редактирование отменено.")
+            delete_message_later(peer_id, conversation_message_id)
+            show_welcome_status(peer_id, sender_id, key)
+            return True
+        else:
+            if 'buffer' not in state_data:
+                state_data['buffer'] = ""
+            if state_data['buffer']:
+                state_data['buffer'] += "\n"
+            state_data['buffer'] += clean_text
+            safe_menu_state_set(key, state_data)
+            return True
+
+    if current_state == 'manage_welcome':
+        if clean_text == "📝 Изменить текст":
+            state_data['state'] = 'wait_welcome_text'
+            state_data['buffer'] = ""
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "📥 Отправьте новое приветствие (можно несколькими сообщениями).\nПо окончании нажмите «💾 Сохранить».", get_buffer_keyboard())
+            delete_message_later(peer_id, conversation_message_id)
+            return True
+        elif clean_text == "🔕 Отключить":
+            set_welcome_enabled(peer_id, False)
+            show_welcome_status(peer_id, sender_id, key)
+            delete_message_later(peer_id, conversation_message_id)
+            return True
+        elif clean_text == "🔊 Включить":
+            set_welcome_enabled(peer_id, True)
+            show_welcome_status(peer_id, sender_id, key)
+            delete_message_later(peer_id, conversation_message_id)
+            return True
+        elif clean_text == "🔙 Назад":
+            state_data['state'] = 'manage_main'
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "🛠 Панель управления материалами:", get_manage_main_keyboard())
+            delete_message_later(peer_id, conversation_message_id)
+            return True
+        else:
+            return True
+
+    # ===== ОСТАЛЬНЫЕ СОСТОЯНИЯ (без изменений) =====
     if current_state in ['wait_st1_text', 'wait_st2_text', 'wait_creative_text', 'wait_new_topic', 'wait_template_text', 'wait_report_template',
-                         'wait_edit_question_text', 'wait_edit_option_text', 'wait_add_question_text', 'wait_enter_options_text', 'wait_enter_correct']:
+                         'wait_edit_question_text', 'wait_edit_option_text', 'wait_add_question_text', 'wait_enter_options_text', 'wait_enter_correct',
+                         'manage_set_time', 'manage_set_threshold', 'manage_edit_options_change',
+                         'manage_add_question', 'manage_enter_options_type', 'manage_edit_options_text']:
         if clean_text not in ["💾 Сохранить", "➡️ Далее", "🔙 Назад", "✅ Готово", "➕ Ещё вариант"]:
             if 'buffer' not in state_data:
                 state_data['buffer'] = ""
@@ -2281,7 +2845,6 @@ def handle_manage_message(text, peer_id, sender_id, conversation_message_id):
             safe_menu_state_set(key, state_data)
             return True
 
-    # ----- НАВИГАЦИЯ НАЗАД -----
     if clean_text == "🔙 Назад":
         delete_original()
         if current_state in ['manage_st1', 'manage_st2', 'manage_st3_topics', 'manage_st4_types']:
@@ -2354,9 +2917,15 @@ def handle_manage_message(text, peer_id, sender_id, conversation_message_id):
             send_menu(peer_id, sender_id, "🛠 Панель управления материалами:", get_manage_main_keyboard())
         return True
 
-    # ----- ОСНОВНОЕ МЕНЮ УПРАВЛЕНИЯ -----
+    # В основном меню управления
     if current_state == 'manage_main':
-        if clean_text == "🗣 Собеседование":
+        if clean_text == "👋 Приветствие":
+            state_data['state'] = 'manage_welcome'
+            safe_menu_state_set(key, state_data)
+            show_welcome_status(peer_id, sender_id, key)
+            delete_message_later(peer_id, conversation_message_id)
+            return True
+        elif clean_text == "🗣 Собеседование":
             state_data['state'] = 'manage_st1'
             safe_menu_state_set(key, state_data)
             current_txt = get_setting("st1_text", None, peer_id)
@@ -2394,7 +2963,7 @@ def handle_manage_message(text, peer_id, sender_id, conversation_message_id):
             send_menu(peer_id, sender_id, "🏛 Главное меню:", get_main_menu_keyboard(is_full_access(sender_id), can_manage, is_dc))
         return True
 
-    # ----- УПРАВЛЕНИЕ СОБЕСЕДОВАНИЕМ -----
+    # Остальные обработчики (собеседование, лекция, тесты, творческое) остаются без изменений
     if current_state == 'manage_st1':
         if clean_text == "➕ Изменить текст":
             state_data['state'] = 'wait_st1_text'
@@ -2412,7 +2981,6 @@ def handle_manage_message(text, peer_id, sender_id, conversation_message_id):
         delete_message_later(peer_id, conversation_message_id)
         return True
 
-    # ----- УПРАВЛЕНИЕ ЛЕКЦИЕЙ -----
     if current_state == 'manage_st2':
         if clean_text == "➕ Изменить текст":
             state_data['state'] = 'wait_st2_text'
@@ -2430,7 +2998,7 @@ def handle_manage_message(text, peer_id, sender_id, conversation_message_id):
         delete_message_later(peer_id, conversation_message_id)
         return True
 
-    # ----- УПРАВЛЕНИЕ ТЕСТАМИ (по одному) -----
+    # ---------- Тесты (по одному) ----------
     if current_state == 'manage_st3_topics':
         topics_map = {
             "Конституция": "Конституция",
@@ -2440,392 +3008,388 @@ def handle_manage_message(text, peer_id, sender_id, conversation_message_id):
             "Процессуальный кодекс": "Процессуальный_кодекс"
         }
         if clean_text in topics_map:
-            state_data['selected_topic'] = topics_map[clean_text]
+            topic = topics_map[clean_text]
             state_data['state'] = 'manage_st3_variants'
+            state_data['selected_topic'] = topic
             safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, f"Выберите вариант для {clean_text}:", get_stage3_variants_keyboard(topics_map[clean_text]))
+            send_menu(peer_id, sender_id, f"Выберите вариант для {clean_text}:", get_stage3_variants_keyboard(topic))
         return True
 
     if current_state == 'manage_st3_variants':
-        match = re.search(r'вариант (\d+)', clean_text)
-        if match:
-            variant = int(match.group(1))
-            state_data['selected_variant'] = variant
+        topic = state_data.get('selected_topic')
+        display_topic = topic.replace('_', ' ')
+        for v in [1, 2, 3]:
+            if clean_text == f"{display_topic} вариант {v}":
+                state_data['selected_variant'] = v
+                state_data['state'] = 'manage_edit_one_by_one'
+                safe_menu_state_set(key, state_data)
+                questions = get_test_questions(topic, v, peer_id)
+                if questions:
+                    msg = f"❓ Режим по одному. Тема: {display_topic}, вариант {v}\n\nВопросов: {len(questions)}\n\n"
+                    for q in questions:
+                        msg += f"{q['order_num']}. {q['question_text']}\n"
+                    msg += "\nВыберите действие:"
+                    send_menu(peer_id, sender_id, msg, get_manage_test_questions_keyboard())
+                else:
+                    send_menu(peer_id, sender_id, f"❓ Режим по одному. Тема: {display_topic}, вариант {v}\n\nВопросов пока нет.\nДобавьте вопросы:", get_manage_test_questions_keyboard())
+                return True
+
+    if current_state == 'manage_edit_one_by_one':
+        topic = state_data.get('selected_topic')
+        variant = state_data.get('selected_variant')
+        if clean_text == "➕ Добавить вопрос":
+            state_data['state'] = 'manage_add_question'
+            state_data['buffer'] = ""
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "📝 Введите текст вопроса:", get_buffer_keyboard())
+            return True
+        elif clean_text == "✏️ Редактировать вопрос":
+            questions = get_test_questions(topic, variant, peer_id)
+            if not questions:
+                send_message(peer_id, "❌ Нет вопросов для редактирования.")
+                return True
+            state_data['state'] = 'manage_select_question_to_edit'
+            safe_menu_state_set(key, state_data)
+            kb = get_question_list_keyboard(questions)
+            send_menu(peer_id, sender_id, "Выберите номер вопроса для редактирования:", kb)
+            return True
+        elif clean_text == "🗑 Удалить вопрос":
+            questions = get_test_questions(topic, variant, peer_id)
+            if not questions:
+                send_message(peer_id, "❌ Нет вопросов для удаления.")
+                return True
+            state_data['state'] = 'manage_select_question_to_delete'
+            safe_menu_state_set(key, state_data)
+            kb = get_question_list_keyboard(questions)
+            send_menu(peer_id, sender_id, "Выберите номер вопроса для удаления:", kb)
+            return True
+        elif clean_text == "🗑 Удалить все вопросы":
+            delete_test_questions(peer_id, topic, variant)
+            send_message(peer_id, "✅ Все вопросы удалены.")
             state_data['state'] = 'manage_edit_one_by_one'
             safe_menu_state_set(key, state_data)
-            topic = state_data['selected_topic']
+            send_menu(peer_id, sender_id, f"❓ Режим по одному. Вопросов пока нет.\nДобавьте вопросы:", get_manage_test_questions_keyboard())
+            return True
+
+    if current_state == 'manage_add_question':
+        if clean_text == "💾 Сохранить":
+            question_text = state_data.get('buffer', '').strip()
+            if not question_text:
+                send_message(peer_id, "❌ Вопрос не может быть пустым.")
+                return True
+            state_data['question_text'] = question_text
+            state_data['state'] = 'manage_enter_options_type'
+            state_data['buffer'] = ""
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "Введите варианты ответов.\nКаждый вариант с новой строки в формате:\n<буква>. <текст>\nНапример:\nА. Вариант 1\nБ. Вариант 2\n\nПосле ввода всех вариантов нажмите «✅ Готово».", get_add_option_keyboard())
+            return True
+
+    if current_state == 'manage_enter_options_type':
+        if clean_text == "✅ Готово":
+            options_text = state_data.get('buffer', '').strip()
+            if not options_text:
+                send_message(peer_id, "❌ Нужно ввести хотя бы один вариант.")
+                return True
+            lines = options_text.splitlines()
+            options = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                match = re.match(r'^([А-Яа-яA-Za-z])[\.\)]\s*(.+)$', line)
+                if not match:
+                    send_message(peer_id, f"❌ Неверный формат строки: {line}\nИспользуйте «А. текст» или «А) текст».")
+                    return True
+                label = match.group(1).upper()
+                text_option = match.group(2).strip()
+                options.append((label, text_option))
+            if len(options) < 2:
+                send_message(peer_id, "❌ Должно быть минимум 2 варианта.")
+                return True
+            state_data['options'] = options
+            state_data['state'] = 'manage_enter_correct'
+            state_data['buffer'] = ""
+            safe_menu_state_set(key, state_data)
+            options_list = "\n".join([f"{label}). {text}" for label, text in options])
+            send_menu(peer_id, sender_id, f"Введите номер (букву) правильного варианта из списка:\n\n{options_list}", get_buffer_keyboard())
+            return True
+        elif clean_text == "➕ Ещё вариант":
+            pass
+        else:
+            if 'buffer' not in state_data:
+                state_data['buffer'] = ""
+            if state_data['buffer']:
+                state_data['buffer'] += "\n"
+            state_data['buffer'] += clean_text
+            safe_menu_state_set(key, state_data)
+            return True
+
+    if current_state == 'manage_enter_correct':
+        if clean_text == "💾 Сохранить":
+            correct_label = state_data.get('buffer', '').strip().upper()
+            options = state_data.get('options', [])
+            correct_index = None
+            for i, (label, text) in enumerate(options):
+                if label.upper() == correct_label:
+                    correct_index = i
+                    break
+            if correct_index is None:
+                send_message(peer_id, "❌ Неверная буква. Попробуйте снова.")
+                # Очищаем буфер, чтобы пользователь мог ввести заново
+                state_data['buffer'] = ""
+                safe_menu_state_set(key, state_data)
+                return True
+            topic = state_data.get('selected_topic')
+            variant = state_data.get('selected_variant')
+            question_text = state_data.get('question_text')
+            order_num = len(get_test_questions(topic, variant, peer_id)) + 1
+            add_test_question(peer_id, topic, variant, question_text, correct_index, order_num, options)
+            send_message(peer_id, "✅ Вопрос добавлен!")
+            state_data['state'] = 'manage_edit_one_by_one'
+            safe_menu_state_set(key, state_data)
             questions = get_test_questions(topic, variant, peer_id)
             if questions:
-                msg = "❓ Режим по одному. Вопросов: {}\n\n".format(len(questions))
+                msg = f"❓ Режим по одному. Вопросов: {len(questions)}\n\n"
                 for q in questions:
                     msg += f"{q['order_num']}. {q['question_text']}\n"
                 msg += "\nВыберите действие:"
                 send_menu(peer_id, sender_id, msg, get_manage_test_questions_keyboard())
             else:
                 send_menu(peer_id, sender_id, "❓ Режим по одному. Вопросов пока нет.\nДобавьте вопросы:", get_manage_test_questions_keyboard())
-        return True
-
-    # ----- РЕДАКТИРОВАНИЕ ВОПРОСОВ ПО ОДНОМУ -----
-    if current_state == 'manage_edit_one_by_one':
-        if clean_text == "➕ Добавить вопрос":
-            state_data['state'] = 'manage_add_question'
-            state_data['question_data'] = {}
-            state_data['option_list'] = []
-            state_data['option_type'] = None
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "Введите текст вопроса (можно несколькими словами).\nДля отмены введите 'стоп'.", None)
             return True
-        elif clean_text == "✏️ Редактировать вопрос":
-            questions = get_test_questions(state_data['selected_topic'], state_data['selected_variant'], peer_id)
-            if not questions:
-                send_message(peer_id, "Нет вопросов для редактирования.")
-                return True
-            state_data['state'] = 'manage_select_question_to_edit'
+        else:
+            # Вместо добавления в буфер — заменяем его новым значением
+            state_data['buffer'] = clean_text
             safe_menu_state_set(key, state_data)
-            msg = "Выберите номер вопроса для редактирования:\n"
-            for i, q in enumerate(questions, 1):
-                msg += f"{i}. {q['question_text']}\n"
-            send_menu(peer_id, sender_id, msg, get_question_list_keyboard(questions))
-            return True
-        elif clean_text == "🗑 Удалить вопрос":
-            questions = get_test_questions(state_data['selected_topic'], state_data['selected_variant'], peer_id)
-            if not questions:
-                send_message(peer_id, "Нет вопросов для удаления.")
-                return True
-            state_data['state'] = 'manage_select_question_to_delete'
-            safe_menu_state_set(key, state_data)
-            msg = "Выберите номер вопроса для удаления:\n"
-            for i, q in enumerate(questions, 1):
-                msg += f"{i}. {q['question_text']}\n"
-            send_menu(peer_id, sender_id, msg, get_question_list_keyboard(questions))
-            return True
-        elif clean_text == "🗑 Удалить все вопросы":
-            topic = state_data['selected_topic']
-            variant = state_data['selected_variant']
-            delete_test_questions(peer_id, topic, variant)
-            send_message(peer_id, "✅ Все вопросы удалены.")
-            state_data['state'] = 'manage_edit_one_by_one'
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "❓ Режим по одному. Вопросов пока нет.\nДобавьте вопросы:", get_manage_test_questions_keyboard())
-            return True
-        elif clean_text == "🔙 Назад":
-            state_data['state'] = 'manage_st3_variants'
-            topic = state_data['selected_topic']
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, f"Выберите вариант для {topic}:", get_stage3_variants_keyboard(topic))
             return True
 
-    # ----- ВЫБОР ВОПРОСА ДЛЯ РЕДАКТИРОВАНИЯ -----
     if current_state == 'manage_select_question_to_edit':
-        try:
-            num = int(clean_text)
-            questions = get_test_questions(state_data['selected_topic'], state_data['selected_variant'], peer_id)
-            if 1 <= num <= len(questions):
-                q = questions[num-1]
+        if clean_text.isdigit():
+            qnum = int(clean_text)
+            topic = state_data.get('selected_topic')
+            variant = state_data.get('selected_variant')
+            questions = get_test_questions(topic, variant, peer_id)
+            if 1 <= qnum <= len(questions):
+                q = questions[qnum-1]
                 state_data['edit_question_id'] = q['id']
-                state_data['edit_question_order'] = q['order_num']
                 state_data['state'] = 'manage_edit_question'
                 safe_menu_state_set(key, state_data)
-                send_menu(peer_id, sender_id, f"Редактируем вопрос #{num}:\nТекущий текст: {q['question_text']}\nВведите новый текст вопроса (или 'стоп' для отмены):", None)
+                send_menu(peer_id, sender_id, f"Редактируем вопрос {qnum}:\n\n{q['question_text']}\n\nЧто сделать?", get_edit_question_keyboard())
             else:
-                send_message(peer_id, "Введите корректный номер.")
-        except ValueError:
-            send_message(peer_id, "Введите число.")
+                send_message(peer_id, "❌ Неверный номер.")
         return True
 
-    if current_state == 'manage_edit_question':
-        if clean_text.lower() == 'стоп':
-            state_data['state'] = 'manage_edit_one_by_one'
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "❓ Редактирование отменено.", get_manage_test_questions_keyboard())
-            return True
-        state_data['edit_question_text'] = clean_text
-        state_data['state'] = 'manage_edit_options_type'
-        safe_menu_state_set(key, state_data)
-        send_menu(peer_id, sender_id, "Выберите тип меток для вариантов (новые варианты перезапишут старые):\n1 - A, B, C...\n2 - 1, 2, 3...\n3 - А, Б, В...", None)
-        return True
-
-    if current_state == 'manage_edit_options_type':
-        if clean_text in ['1', '2', '3']:
-            state_data['edit_option_type'] = clean_text
-            state_data['state'] = 'manage_edit_options_text'
-            state_data['edit_option_list'] = []
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "Введите текст первого варианта ответа (новые варианты перезапишут старые):", get_add_option_keyboard())
-            return True
-        else:
-            send_message(peer_id, "Пожалуйста, выберите 1, 2 или 3.")
-            return True
-
-    if current_state == 'manage_edit_options_text':
-        if clean_text == "✅ Готово":
-            if not state_data.get('edit_option_list'):
-                send_message(peer_id, "Вы не ввели ни одного варианта. Введите хотя бы один.")
-                return True
-            state_data['state'] = 'manage_edit_correct'
-            safe_menu_state_set(key, state_data)
-            options = state_data['edit_option_list']
-            labels = get_option_labels(len(options), state_data['edit_option_type'])
-            msg = "Введите номер правильного варианта (1-{}):\n".format(len(options))
-            for i, (label, text) in enumerate(zip(labels, options), 1):
-                msg += f"{i}. {label}) {text}\n"
-            send_menu(peer_id, sender_id, msg, None)
-            return True
-        elif clean_text == "➕ Ещё вариант":
-            send_message(peer_id, "Введите текст следующего варианта:")
-            return True
-        elif clean_text == "🔙 Назад":
-            state_data['state'] = 'manage_edit_one_by_one'
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "❓ Редактирование отменено.", get_manage_test_questions_keyboard())
-            return True
-        else:
-            if 'edit_option_list' not in state_data:
-                state_data['edit_option_list'] = []
-            state_data['edit_option_list'].append(clean_text)
-            send_message(peer_id, f"Вариант {len(state_data['edit_option_list'])} сохранён.\nВведите следующий вариант или нажмите «✅ Готово».", keyboard=get_add_option_keyboard())
-            safe_menu_state_set(key, state_data)
-            return True
-
-    if current_state == 'manage_edit_correct':
-        try:
-            correct_num = int(clean_text)
-            options = state_data['edit_option_list']
-            if 1 <= correct_num <= len(options):
-                correct_index = correct_num - 1
-                qid = state_data['edit_question_id']
-                topic = state_data['selected_topic']
-                variant = state_data['selected_variant']
-                question_text = state_data['edit_question_text']
-                labels = get_option_labels(len(options), state_data['edit_option_type'])
-                order = state_data['edit_question_order']
-                update_test_question(qid, question_text, correct_index, list(zip(labels, options)), peer_id)
-                send_message(peer_id, "✅ Вопрос обновлён!")
-                state_data['state'] = 'manage_edit_one_by_one'
-                safe_menu_state_set(key, state_data)
-                questions = get_test_questions(topic, variant, peer_id)
-                if questions:
-                    msg = "❓ Режим по одному. Вопросов: {}\n\n".format(len(questions))
-                    for q in questions:
-                        msg += f"{q['order_num']}. {q['question_text']}\n"
-                    msg += "\nВыберите действие:"
-                    send_menu(peer_id, sender_id, msg, get_manage_test_questions_keyboard())
-                else:
-                    send_menu(peer_id, sender_id, "❓ Режим по одному. Вопросов пока нет.\nДобавьте вопросы:", get_manage_test_questions_keyboard())
-                return True
-            else:
-                send_message(peer_id, f"Введите число от 1 до {len(options)}.")
-        except ValueError:
-            send_message(peer_id, "Пожалуйста, введите число.")
-        return True
-
-    # ----- ВЫБОР ВОПРОСА ДЛЯ УДАЛЕНИЯ -----
     if current_state == 'manage_select_question_to_delete':
-        try:
-            num = int(clean_text)
-            questions = get_test_questions(state_data['selected_topic'], state_data['selected_variant'], peer_id)
-            if 1 <= num <= len(questions):
-                q = questions[num-1]
-                qid = q['id']
-                delete_test_question(qid, peer_id)
+        if clean_text.isdigit():
+            qnum = int(clean_text)
+            topic = state_data.get('selected_topic')
+            variant = state_data.get('selected_variant')
+            questions = get_test_questions(topic, variant, peer_id)
+            if 1 <= qnum <= len(questions):
+                q = questions[qnum-1]
+                delete_test_question(q['id'], peer_id)
                 send_message(peer_id, "✅ Вопрос удалён.")
                 state_data['state'] = 'manage_edit_one_by_one'
                 safe_menu_state_set(key, state_data)
-                questions = get_test_questions(state_data['selected_topic'], state_data['selected_variant'], peer_id)
-                if questions:
-                    msg = "❓ Режим по одному. Вопросов: {}\n\n".format(len(questions))
-                    for q in questions:
-                        msg += f"{q['order_num']}. {q['question_text']}\n"
-                    msg += "\nВыберите действие:"
-                    send_menu(peer_id, sender_id, msg, get_manage_test_questions_keyboard())
-                else:
-                    send_menu(peer_id, sender_id, "❓ Режим по одному. Вопросов пока нет.\nДобавьте вопросы:", get_manage_test_questions_keyboard())
-            else:
-                send_message(peer_id, "Введите корректный номер.")
-        except ValueError:
-            send_message(peer_id, "Введите число.")
-        return True
-
-    # ----- ДОБАВЛЕНИЕ НОВОГО ВОПРОСА -----
-    if current_state == 'manage_add_question':
-        if clean_text.lower() == 'стоп':
-            state_data['state'] = 'manage_edit_one_by_one'
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "❓ Добавление отменено.", get_manage_test_questions_keyboard())
-            return True
-        state_data['question_data']['question'] = clean_text
-        state_data['state'] = 'manage_enter_options_type'
-        safe_menu_state_set(key, state_data)
-        send_menu(peer_id, sender_id, "Выберите тип меток для вариантов:\n1 - A, B, C...\n2 - 1, 2, 3...\n3 - А, Б, В...", None)
-        return True
-
-    if current_state == 'manage_enter_options_type':
-        if clean_text in ['1', '2', '3']:
-            state_data['option_type'] = clean_text
-            state_data['state'] = 'manage_enter_options_text'
-            state_data['option_list'] = []
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "Введите текст первого варианта ответа:", get_add_option_keyboard())
-            return True
-        else:
-            send_message(peer_id, "Пожалуйста, выберите 1, 2 или 3.")
-            return True
-
-    if current_state == 'manage_enter_options_text':
-        if clean_text == "✅ Готово":
-            if not state_data.get('option_list'):
-                send_message(peer_id, "Вы не ввели ни одного варианта. Введите хотя бы один.")
-                return True
-            state_data['state'] = 'manage_enter_correct'
-            safe_menu_state_set(key, state_data)
-            options = state_data['option_list']
-            labels = get_option_labels(len(options), state_data['option_type'])
-            msg = "Введите номер правильного варианта (1-{}):\n".format(len(options))
-            for i, (label, text) in enumerate(zip(labels, options), 1):
-                msg += f"{i}. {label}) {text}\n"
-            send_menu(peer_id, sender_id, msg, None)
-            return True
-        elif clean_text == "➕ Ещё вариант":
-            send_message(peer_id, "Введите текст следующего варианта:")
-            return True
-        elif clean_text == "🔙 Назад":
-            state_data['state'] = 'manage_edit_one_by_one'
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "❓ Редактирование отменено.", get_manage_test_questions_keyboard())
-            return True
-        else:
-            if 'option_list' not in state_data:
-                state_data['option_list'] = []
-            state_data['option_list'].append(clean_text)
-            send_message(peer_id, f"Вариант {len(state_data['option_list'])} сохранён.\nВведите следующий вариант или нажмите «✅ Готово».", keyboard=get_add_option_keyboard())
-            safe_menu_state_set(key, state_data)
-            return True
-
-    if current_state == 'manage_enter_correct':
-        try:
-            correct_num = int(clean_text)
-            options = state_data['option_list']
-            if 1 <= correct_num <= len(options):
-                correct_index = correct_num - 1
-                topic = state_data['selected_topic']
-                variant = state_data['selected_variant']
-                question_text = state_data['question_data']['question']
-                labels = get_option_labels(len(options), state_data['option_type'])
-                conn = get_db_connection(peer_id)
-                try:
-                    cur = conn.cursor()
-                    cur.execute("SELECT MAX(order_num) FROM test_questions WHERE topic=? AND variant=?", (topic, variant))
-                    row = cur.fetchone()
-                    order = (row[0] or 0) + 1
-                finally:
-                    conn.close()
-                add_test_question(peer_id, topic, variant, question_text, correct_index, order, list(zip(labels, options)))
-                send_message(peer_id, "✅ Вопрос добавлен!")
-                state_data['state'] = 'manage_edit_one_by_one'
-                safe_menu_state_set(key, state_data)
                 questions = get_test_questions(topic, variant, peer_id)
                 if questions:
-                    msg = "❓ Режим по одному. Вопросов: {}\n\n".format(len(questions))
+                    msg = f"❓ Режим по одному. Вопросов: {len(questions)}\n\n"
                     for q in questions:
                         msg += f"{q['order_num']}. {q['question_text']}\n"
                     msg += "\nВыберите действие:"
                     send_menu(peer_id, sender_id, msg, get_manage_test_questions_keyboard())
                 else:
                     send_menu(peer_id, sender_id, "❓ Режим по одному. Вопросов пока нет.\nДобавьте вопросы:", get_manage_test_questions_keyboard())
-                return True
             else:
-                send_message(peer_id, f"Введите число от 1 до {len(options)}.")
-        except ValueError:
-            send_message(peer_id, "Пожалуйста, введите число.")
+                send_message(peer_id, "❌ Неверный номер.")
         return True
 
-    # ----- УПРАВЛЕНИЕ ТВОРЧЕСКИМИ =====
-    if current_state == 'manage_st4_variants':
-        ctype = state_data.get('selected_ctype')
-        if not ctype:
-            return True
-
-        # Определяем выбранный вариант
-        variant = None
-        if ctype == "Ходатайства":
-            for v, name in HODAITSTVA_NAMES.items():
-                if clean_text == name:
-                    variant = v
-                    break
-        elif ctype == "Обращение_в_прокуратуру_Иск":
-            match = re.match(r'^Обращение в прокуратуру/Иск вариант (\d+)$', clean_text)
-            if match:
-                variant = int(match.group(1))
-        elif ctype == "Доклад":
-            if clean_text == "Доклад вариант 1":
-                variant = 1
-
-        if variant is not None:
-            state_data['selected_variant'] = variant
-            state_data['state'] = 'manage_st4_action'
-            safe_menu_state_set(key, state_data)
-            row = get_creative_text(ctype, variant, peer_id)
-            if row and row['task_text']:
-                msg = f"📝 Текущий текст для {ctype} вариант {variant}:\n\n{row['task_text']}"
-            else:
-                msg = f"📭 Текст для {ctype} вариант {variant} не задан."
-            send_menu(peer_id, sender_id, msg, get_manage_action_keyboard())
-        return True
-
-    if current_state == 'manage_st4_action':
-        ctype = state_data.get('selected_ctype')
-        variant = state_data.get('selected_variant')
-        if not ctype or not variant:
-            return True
-
-        if clean_text == "🔍 Посмотреть":
-            row = get_creative_text(ctype, variant, peer_id)
-            if row and row['task_text']:
-                send_long_message(peer_id, f"📎 Текст творческого задания:\n\n{row['task_text']}")
-            else:
-                send_message(peer_id, "📭 Текст не задан.")
-            return True
-
-        elif clean_text == "➕ Добавить/Заменить":
-            state_data['state'] = 'wait_creative_text'
+    if current_state == 'manage_edit_question':
+        if clean_text == "✏️ Редактировать вопрос":
+            state_data['state'] = 'wait_edit_question_text'
             state_data['buffer'] = ""
             safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "📥 Отправьте текст творческого задания (можно несколькими сообщениями).\nПо окончании нажмите «💾 Сохранить».", get_buffer_keyboard())
+            send_menu(peer_id, sender_id, "Введите новый текст вопроса:", get_buffer_keyboard())
             return True
-
-        elif clean_text == "🗑 Удалить":
-            delete_creative_text(ctype, variant, peer_id)
-            send_message(peer_id, "🗑 Текст творческого задания удалён.")
-            state_data['state'] = 'manage_st4_variants'
+        elif clean_text == "✏️ Редактировать варианты":
+            state_data['state'] = 'manage_edit_options'
             safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, f"Выберите вариант для {ctype}:", get_stage4_variants_keyboard(ctype))
+            qid = state_data.get('edit_question_id')
+            options = get_test_options(qid, peer_id)
+            if not options:
+                send_message(peer_id, "❌ У вопроса нет вариантов.")
+                return True
+            options_list = "\n".join([f"{i+1}. {opt['option_label']}). {opt['option_text']}" for i, opt in enumerate(options)])
+            send_menu(peer_id, sender_id, f"Текущие варианты:\n\n{options_list}\n\nВыберите действие:", get_edit_options_keyboard())
             return True
-
-        elif clean_text == "🔙 Назад":
-            state_data['state'] = 'manage_st4_variants'
+        elif clean_text == "🗑 Удалить вопрос":
+            qid = state_data.get('edit_question_id')
+            delete_test_question(qid, peer_id)
+            send_message(peer_id, "✅ Вопрос удалён.")
+            state_data['state'] = 'manage_edit_one_by_one'
             safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, f"Выберите вариант для {ctype}:", get_stage4_variants_keyboard(ctype))
-            return True
-
-    if current_state == 'wait_creative_text' and clean_text == "💾 Сохранить":
-        final_text = state_data.get('buffer', '').strip()
-        ctype = state_data.get('selected_ctype')
-        variant = state_data.get('selected_variant')
-        if ctype and variant:
-            set_creative_text(ctype, variant, final_text, peer_id)
-            send_message(peer_id, f"✅ Текст для {ctype} вариант {variant} сохранён.")
-            state_data['state'] = 'manage_st4_action'
-            safe_menu_state_set(key, state_data)
-            row = get_creative_text(ctype, variant, peer_id)
-            if row and row['task_text']:
-                msg = f"📝 Текущий текст для {ctype} вариант {variant}:\n\n{row['task_text']}"
+            topic = state_data.get('selected_topic')
+            variant = state_data.get('selected_variant')
+            questions = get_test_questions(topic, variant, peer_id)
+            if questions:
+                msg = f"❓ Режим по одному. Вопросов: {len(questions)}\n\n"
+                for q in questions:
+                    msg += f"{q['order_num']}. {q['question_text']}\n"
+                msg += "\nВыберите действие:"
+                send_menu(peer_id, sender_id, msg, get_manage_test_questions_keyboard())
             else:
-                msg = f"📭 Текст для {ctype} вариант {variant} не задан."
-            send_menu(peer_id, sender_id, msg, get_manage_action_keyboard())
-            delete_message_later(peer_id, conversation_message_id)
+                send_menu(peer_id, sender_id, "❓ Режим по одному. Вопросов пока нет.\nДобавьте вопросы:", get_manage_test_questions_keyboard())
+            return True
+
+    if current_state == 'wait_edit_question_text':
+        if clean_text == "💾 Сохранить":
+            new_text = state_data.get('buffer', '').strip()
+            if not new_text:
+                send_message(peer_id, "❌ Текст не может быть пустым.")
+                return True
+            qid = state_data.get('edit_question_id')
+            conn = get_db_connection(peer_id)
+            try:
+                conn.execute("UPDATE test_questions SET question_text=? WHERE id=?", (new_text, qid))
+                conn.commit()
+            finally:
+                conn.close()
+            send_message(peer_id, "✅ Текст вопроса обновлён.")
+            state_data['state'] = 'manage_edit_question'
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "Вопрос обновлён. Что сделать дальше?", get_edit_question_keyboard())
+            return True
+
+    if current_state == 'manage_edit_options':
+        if clean_text == "➕ Добавить вариант":
+            state_data['state'] = 'manage_edit_options_text'
+            state_data['buffer'] = ""
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "Введите новый вариант в формате:\n<буква>. <текст>", get_buffer_keyboard())
+            return True
+        elif clean_text == "🗑 Удалить вариант":
+            qid = state_data.get('edit_question_id')
+            options = get_test_options(qid, peer_id)
+            if not options:
+                send_message(peer_id, "❌ Нет вариантов для удаления.")
+                return True
+            state_data['state'] = 'manage_edit_options_delete'
+            safe_menu_state_set(key, state_data)
+            options_list = "\n".join([f"{i+1}. {opt['option_label']}). {opt['option_text']}" for i, opt in enumerate(options)])
+            send_menu(peer_id, sender_id, f"Выберите номер варианта для удаления:\n\n{options_list}\n\n(введите число)", get_buffer_keyboard(next_step=True))
+            return True
+        elif clean_text == "✏️ Изменить вариант":
+            qid = state_data.get('edit_question_id')
+            options = get_test_options(qid, peer_id)
+            if not options:
+                send_message(peer_id, "❌ Нет вариантов для изменения.")
+                return True
+            state_data['state'] = 'manage_edit_options_select'
+            safe_menu_state_set(key, state_data)
+            options_list = "\n".join([f"{i+1}. {opt['option_label']}). {opt['option_text']}" for i, opt in enumerate(options)])
+            send_menu(peer_id, sender_id, f"Выберите номер варианта для изменения:\n\n{options_list}\n\n(введите число)", get_buffer_keyboard(next_step=True))
+            return True
+        elif clean_text == "✅ Готово":
+            state_data['state'] = 'manage_edit_question'
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, "Возврат к редактированию вопроса.", get_edit_question_keyboard())
+            return True
+
+    if current_state == 'manage_edit_options_text':
+        if clean_text == "💾 Сохранить":
+            line = state_data.get('buffer', '').strip()
+            match = re.match(r'^([А-Яа-яA-Za-z])[\.\)]\s*(.+)$', line)
+            if not match:
+                send_message(peer_id, "❌ Неверный формат. Используйте «А. текст» или «А) текст».")
+                return True
+            label = match.group(1).upper()
+            text_option = match.group(2).strip()
+            qid = state_data.get('edit_question_id')
+            conn = get_db_connection(peer_id)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT MAX(id) FROM test_options WHERE question_id=?", (qid,))
+                max_id = cur.fetchone()[0]
+                if max_id is None:
+                    max_id = 0
+                new_order = max_id + 1
+                cur.execute("INSERT INTO test_options (question_id, option_label, option_text) VALUES (?, ?, ?)", (qid, label, text_option))
+                conn.commit()
+            finally:
+                conn.close()
+            send_message(peer_id, "✅ Вариант добавлен.")
+            state_data['state'] = 'manage_edit_options'
+            safe_menu_state_set(key, state_data)
+            qid = state_data.get('edit_question_id')
+            options = get_test_options(qid, peer_id)
+            options_list = "\n".join([f"{i+1}. {opt['option_label']}). {opt['option_text']}" for i, opt in enumerate(options)])
+            send_menu(peer_id, sender_id, f"Текущие варианты:\n\n{options_list}\n\nВыберите действие:", get_edit_options_keyboard())
+            return True
+
+    if current_state == 'manage_edit_options_delete':
+        if clean_text.isdigit():
+            idx = int(clean_text) - 1
+            qid = state_data.get('edit_question_id')
+            options = get_test_options(qid, peer_id)
+            if 0 <= idx < len(options):
+                opt_id = options[idx]['id']
+                conn = get_db_connection(peer_id)
+                try:
+                    conn.execute("DELETE FROM test_options WHERE id=?", (opt_id,))
+                    conn.commit()
+                finally:
+                    conn.close()
+                send_message(peer_id, "✅ Вариант удалён.")
+                state_data['state'] = 'manage_edit_options'
+                safe_menu_state_set(key, state_data)
+                options = get_test_options(qid, peer_id)
+                options_list = "\n".join([f"{i+1}. {opt['option_label']}. {opt['option_text']}" for i, opt in enumerate(options)])
+                send_menu(peer_id, sender_id, f"Текущие варианты:\n\n{options_list}\n\nВыберите действие:", get_edit_options_keyboard())
+            else:
+                send_message(peer_id, "❌ Неверный номер.")
         return True
 
-    # ----- УПРАВЛЕНИЕ ТЕМАМИ ДОКЛАДОВ -----
+    if current_state == 'manage_edit_options_select':
+        if clean_text.isdigit():
+            idx = int(clean_text) - 1
+            qid = state_data.get('edit_question_id')
+            options = get_test_options(qid, peer_id)
+            if 0 <= idx < len(options):
+                state_data['edit_option_id'] = options[idx]['id']
+                state_data['state'] = 'manage_edit_options_change'
+                state_data['buffer'] = ""
+                safe_menu_state_set(key, state_data)
+                send_menu(peer_id, sender_id, f"Введите новый текст для варианта {options[idx]['option_label']}:\n(формат: <буква>. <текст>)", get_buffer_keyboard())
+            else:
+                send_message(peer_id, "❌ Неверный номер.")
+        return True
+
+    if current_state == 'manage_edit_options_change':
+        if clean_text == "💾 Сохранить":
+            line = state_data.get('buffer', '').strip()
+            match = re.match(r'^([А-Яа-яA-Za-z])[\.\)]\s*(.+)$', line)
+            if not match:
+                send_message(peer_id, "❌ Неверный формат. Используйте «А. текст» или «А) текст».")
+                return True
+            label = match.group(1).upper()
+            text_option = match.group(2).strip()
+            opt_id = state_data.get('edit_option_id')
+            conn = get_db_connection(peer_id)
+            try:
+                conn.execute("UPDATE test_options SET option_label=?, option_text=? WHERE id=?", (label, text_option, opt_id))
+                conn.commit()
+            finally:
+                conn.close()
+            send_message(peer_id, "✅ Вариант обновлён.")
+            state_data['state'] = 'manage_edit_options'
+            safe_menu_state_set(key, state_data)
+            qid = state_data.get('edit_question_id')
+            options = get_test_options(qid, peer_id)
+            options_list = "\n".join([f"{i+1}. {opt['option_label']}). {opt['option_text']}" for i, opt in enumerate(options)])
+            send_menu(peer_id, sender_id, f"Текущие варианты:\n\n{options_list}\n\nВыберите действие:", get_edit_options_keyboard())
+            return True
+
+    # ---------- Творческое ----------
     if current_state == 'manage_st4_types':
         type_map = {
             "Ходатайства": "Ходатайства",
@@ -2833,187 +3397,167 @@ def handle_manage_message(text, peer_id, sender_id, conversation_message_id):
             "Доклад": "Доклад"
         }
         if clean_text in type_map:
-            state_data['selected_ctype'] = type_map[clean_text]
-            if clean_text == "Доклад":
-                state_data['state'] = 'manage_st4_topics'
-                safe_menu_state_set(key, state_data)
-                topics = get_all_topics(peer_id)
-                topics_list = "\n".join([f"{t['id']}. {t['text']} (шаблон: {'есть' if t['template'] else 'нет'})" for t in topics]) if topics else "Список тем пуст."
-                send_menu(peer_id, sender_id, f"📋 ТЕМЫ ДОКЛАДОВ:\n\n{topics_list}", get_creative_topics_keyboard())
+            ctype = type_map[clean_text]
+            state_data['selected_ctype'] = ctype
+            state_data['state'] = 'manage_st4_variants'
+            safe_menu_state_set(key, state_data)
+            send_menu(peer_id, sender_id, f"Выберите вариант для {clean_text}:", get_stage4_variants_keyboard(ctype))
+        return True
+
+    if current_state == 'manage_st4_variants':
+        ctype = state_data.get('selected_ctype')
+        display_type = ctype.replace('_', ' ')
+        if ctype == "Обращение_в_прокуратуру_Иск":
+            display_type = "Обращение в прокуратуру/Иск"
+        if ctype == "Доклад":
+            max_var = 1
+        elif ctype == "Ходатайства":
+            max_var = 6
+        else:
+            max_var = 3
+        for v in range(1, max_var + 1):
+            if ctype == "Ходатайства":
+                expected_label = HODAITSTVA_NAMES.get(v)
+                if clean_text == expected_label:
+                    state_data['selected_variant'] = v
+                    state_data['state'] = 'manage_st4_action'
+                    safe_menu_state_set(key, state_data)
+                    row = get_creative_text(ctype, v, peer_id)
+                    current_text = row['task_text'] if row else "Текст не задан."
+                    send_menu(peer_id, sender_id, f"📎 ТВОРЧЕСКОЕ ЗАДАНИЕ: {expected_label}\n\n{current_text}", get_manage_action_keyboard())
+                    return True
             else:
-                state_data['state'] = 'manage_st4_variants'
-                safe_menu_state_set(key, state_data)
-                send_menu(peer_id, sender_id, f"Выберите вариант для {clean_text}:", get_stage4_variants_keyboard(type_map[clean_text]))
-        return True
+                expected_spaces = f"{display_type} вариант {v}"
+                expected_underscores = f"{ctype} вариант {v}"
+                if clean_text == expected_spaces or clean_text == expected_underscores:
+                    state_data['selected_variant'] = v
+                    state_data['state'] = 'manage_st4_action'
+                    safe_menu_state_set(key, state_data)
+                    row = get_creative_text(ctype, v, peer_id)
+                    current_text = row['task_text'] if row else "Текст не задан."
+                    send_menu(peer_id, sender_id, f"📎 ТВОРЧЕСКОЕ ЗАДАНИЕ: {display_type} вариант {v}\n\n{current_text}", get_manage_action_keyboard())
+                    return True
 
-    if current_state == 'manage_st4_topics':
-        if clean_text == "➕ Добавить тему":
-            state_data['state'] = 'wait_new_topic'
+    if current_state == 'manage_st4_action':
+        if clean_text == "🔍 Посмотреть":
+            ctype = state_data.get('selected_ctype')
+            variant = state_data.get('selected_variant')
+            row = get_creative_text(ctype, variant, peer_id)
+            current_text = row['task_text'] if row else "Текст не задан."
+            send_long_message(peer_id, f"📎 ТЕКСТ ЗАДАНИЯ:\n\n{current_text}")
+            return True
+        elif clean_text == "➕ Добавить/Заменить":
+            ctype = state_data.get('selected_ctype')
+            variant = state_data.get('selected_variant')
+            state_data['state'] = 'wait_creative_text'
             state_data['buffer'] = ""
+            state_data['ctype'] = ctype
+            state_data['variant'] = variant
             safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "📥 Отправьте текст ТЕМЫ доклада.", None)
+            send_menu(peer_id, sender_id, "📥 Отправьте текст творческого задания (можно несколькими сообщениями).\nПо окончании нажмите «💾 Сохранить».", get_buffer_keyboard())
             return True
-        if clean_text == "✏️ Изменить форму доклада":
-            state_data['state'] = 'wait_report_template'
-            state_data['buffer'] = ""
+        elif clean_text == "🗑 Удалить":
+            ctype = state_data.get('selected_ctype')
+            variant = state_data.get('selected_variant')
+            delete_creative_text(ctype, variant, peer_id)
+            send_message(peer_id, "🗑 Задание удалено.")
+            state_data['state'] = 'manage_st4_variants'
             safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "📥 Отправьте новый текст ФОРМЫ ДОКЛАДА (общий шаблон).\nПо окончании нажмите «💾 Сохранить».", get_buffer_keyboard())
+            send_menu(peer_id, sender_id, f"Выберите вариант для {ctype}:", get_stage4_variants_keyboard(ctype))
             return True
-        if clean_text == "🗑 Очистить все темы":
-            delete_all_topics(peer_id)
-            send_message(peer_id, "🗑 Все темы удалены.")
-            state_data['state'] = 'manage_st4_topics'
-            safe_menu_state_set(key, state_data)
-            topics = get_all_topics(peer_id)
-            topics_list = "\n".join([f"{t['id']}. {t['text']} (шаблон: {'есть' if t['template'] else 'нет'})" for t in topics]) if topics else "Список тем пуст."
-            send_menu(peer_id, sender_id, f"📋 ТЕМЫ ДОКЛАДОВ:\n\n{topics_list}", get_creative_topics_keyboard())
-            return True
-        match = re.match(r'^(\d+)\.', clean_text)
-        if match:
-            topic_id = int(match.group(1))
-            row = get_topic_by_id(topic_id, peer_id)
-            if row:
-                state_data['selected_topic_id'] = topic_id
-                state_data['selected_topic_text'] = row['text']
-                state_data['state'] = 'manage_st4_topic_action'
-                safe_menu_state_set(key, state_data)
-                template_status = "есть" if row['template'] else "нет"
-                send_menu(peer_id, sender_id, f"📌 Тема: {row['text']}\nШаблон: {template_status}", get_creative_topic_action_keyboard())
-                return True
 
-    if current_state == 'wait_report_template' and clean_text == "💾 Сохранить":
-        template = state_data.get('buffer', '').strip()
-        set_report_template(template, peer_id)
-        state_data['state'] = 'manage_st4_topics'
+    if current_state == 'wait_creative_text' and clean_text == "💾 Сохранить":
+        final_text = state_data.get('buffer', '').strip()
+        ctype = state_data.get('ctype')
+        variant = state_data.get('variant')
+        set_creative_text(ctype, variant, final_text, peer_id)
+        state_data['state'] = 'manage_st4_action'
         safe_menu_state_set(key, state_data)
-        topics = get_all_topics(peer_id)
-        topics_list = "\n".join([f"{t['id']}. {t['text']} (шаблон: {'есть' if t['template'] else 'нет'})" for t in topics]) if topics else "Список тем пуст."
-        send_menu(peer_id, sender_id, f"📋 ТЕМЫ ДОКЛАДОВ:\n\n{topics_list}\n\n✅ Общий шаблон обновлён.", get_creative_topics_keyboard())
+        send_menu(peer_id, sender_id, f"✅ Творческое задание обновлено!\n\n{final_text if final_text else '(пусто)'}", get_manage_action_keyboard())
         delete_message_later(peer_id, conversation_message_id)
         return True
 
-    if current_state == 'manage_st4_topic_action':
-        if clean_text == "✏️ Изменить шаблон":
-            state_data['state'] = 'wait_template_text'
-            state_data['buffer'] = ""
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "📥 Отправьте новый текст ШАБЛОНА для этой темы.\nПо окончании нажмите «💾 Сохранить».", get_buffer_keyboard())
-            return True
-        if clean_text == "🗑 Удалить тему":
-            topic_id = state_data.get('selected_topic_id')
-            if topic_id:
-                delete_topic(topic_id, peer_id)
-                send_message(peer_id, "🗑 Тема удалена.")
-                state_data['state'] = 'manage_st4_topics'
-                safe_menu_state_set(key, state_data)
-                topics = get_all_topics(peer_id)
-                topics_list = "\n".join([f"{t['id']}. {t['text']} (шаблон: {'есть' if t['template'] else 'нет'})" for t in topics]) if topics else "Список тем пуст."
-                send_menu(peer_id, sender_id, f"📋 ТЕМЫ ДОКЛАДОВ:\n\n{topics_list}", get_creative_topics_keyboard())
-                return True
-        if clean_text == "🔙 Назад":
-            state_data['state'] = 'manage_st4_topics'
-            safe_menu_state_set(key, state_data)
-            topics = get_all_topics(peer_id)
-            topics_list = "\n".join([f"{t['id']}. {t['text']} (шаблон: {'есть' if t['template'] else 'нет'})" for t in topics]) if topics else "Список тем пуст."
-            send_menu(peer_id, sender_id, f"📋 ТЕМЫ ДОКЛАДОВ:\n\n{topics_list}", get_creative_topics_keyboard())
-            return True
-
-    if current_state == 'wait_new_topic':
-        if clean_text not in ["🔙 Назад"]:
-            new_topic = clean_text.strip()
-            if new_topic:
-                state_data['temp_topic'] = new_topic
-                state_data['state'] = 'wait_template_text'
-                state_data['buffer'] = ""
-                safe_menu_state_set(key, state_data)
-                send_menu(peer_id, sender_id, "📥 Отправьте текст ШАБЛОНА для доклада (можно пропустить, отправив пустое сообщение).\nПо окончании нажмите «💾 Сохранить».", get_buffer_keyboard())
-            return True
-
-    if current_state == 'wait_template_text' and clean_text == "💾 Сохранить":
-        template = state_data.get('buffer', '').strip()
-        topic_text = state_data.get('temp_topic', '')
-        if topic_text:
-            add_topic(topic_text, template, peer_id)
-            send_message(peer_id, f"✅ Тема и шаблон добавлены.")
-        state_data['state'] = 'manage_st4_topics'
-        safe_menu_state_set(key, state_data)
-        topics = get_all_topics(peer_id)
-        topics_list = "\n".join([f"{t['id']}. {t['text']} (шаблон: {'есть' if t['template'] else 'нет'})" for t in topics]) if topics else "Список тем пуст."
-        send_menu(peer_id, sender_id, f"📋 ТЕМЫ ДОКЛАДОВ:\n\n{topics_list}", get_creative_topics_keyboard())
-        delete_message_later(peer_id, conversation_message_id)
-        return True
-
-    if current_state == 'wait_template_text' and clean_text == "🔙 Назад":
-        state_data['state'] = 'manage_st4_topics'
-        safe_menu_state_set(key, state_data)
-        topics = get_all_topics(peer_id)
-        topics_list = "\n".join([f"{t['id']}. {t['text']} (шаблон: {'есть' if t['template'] else 'нет'})" for t in topics]) if topics else "Список тем пуст."
-        send_menu(peer_id, sender_id, f"📋 ТЕМЫ ДОКЛАДОВ:\n\n{topics_list}", get_creative_topics_keyboard())
-        return True
-
-    # ----- НАСТРОЙКИ ТЕСТИРОВАНИЯ -----
+    # ---------- Настройки тестирования ----------
     if current_state == 'manage_test_settings':
         if clean_text == "⏱ Время на вопрос":
             state_data['state'] = 'manage_set_time'
             safe_menu_state_set(key, state_data)
-            send_message(peer_id, "Введите время в секундах (число):")
-            return True
+            send_menu(peer_id, sender_id, "Введите новое время на вопрос (в секундах):", get_buffer_keyboard())
         elif clean_text == "❌ Порог ошибок":
             state_data['state'] = 'manage_set_threshold'
             safe_menu_state_set(key, state_data)
-            send_message(peer_id, "Введите допустимое количество ошибок (число):")
-            return True
-        elif clean_text == "🔙 Назад":
-            state_data['state'] = 'manage_main'
-            safe_menu_state_set(key, state_data)
-            send_menu(peer_id, sender_id, "🛠 Панель управления материалами:", get_manage_main_keyboard())
-            return True
+            send_menu(peer_id, sender_id, "Введите новый порог ошибок (число):", get_buffer_keyboard())
+        return True
 
     if current_state == 'manage_set_time':
-        try:
-            val = int(clean_text)
-            if val < 1:
-                raise ValueError
-            set_test_time_limit(peer_id, val)
-            send_message(peer_id, f"✅ Время на вопрос установлено: {val} сек.")
-        except:
-            send_message(peer_id, "❌ Введите положительное число.")
-        state_data['state'] = 'manage_test_settings'
-        safe_menu_state_set(key, state_data)
-        time_limit = get_test_time_limit(peer_id)
-        threshold = get_test_fail_threshold(peer_id)
-        msg = f"⚙️ НАСТРОЙКИ ТЕСТИРОВАНИЯ (по одному)\n\n⏱ Время на вопрос: {time_limit} сек\n❌ Порог ошибок: {threshold}\n\nИспользуйте команды для изменения:\n/settime <сек>\n/setthreshold <число>"
-        send_menu(peer_id, sender_id, msg, get_test_settings_keyboard())
-        return True
+        if clean_text == "💾 Сохранить":
+            try:
+                seconds = int(state_data.get('buffer', '').strip())
+                if seconds < 1:
+                    raise ValueError
+                set_test_time_limit(peer_id, seconds)
+                send_message(peer_id, f"✅ Время на вопрос установлено: {seconds} сек.")
+                # Очищаем буфер после успешного сохранения
+                state_data['buffer'] = ""
+                safe_menu_state_set(key, state_data)
+            except:
+                send_message(peer_id, "❌ Введите положительное целое число (например, 30).")
+                # Очищаем буфер при ошибке, чтобы можно было ввести заново
+                state_data['buffer'] = ""
+                safe_menu_state_set(key, state_data)
+                return True
+            state_data['state'] = 'manage_test_settings'
+            safe_menu_state_set(key, state_data)
+            time_limit = get_test_time_limit(peer_id)
+            threshold = get_test_fail_threshold(peer_id)
+            msg = f"⚙️ НАСТРОЙКИ ТЕСТИРОВАНИЯ (по одному)\n\n⏱ Время на вопрос: {time_limit} сек\n❌ Порог ошибок: {threshold}\n\nИспользуйте команды для изменения:\n/settime <сек>\n/setthreshold <число>"
+            send_menu(peer_id, sender_id, msg, get_test_settings_keyboard())
+            return True
+        else:
+            # Любой другой ввод заменяет буфер (а не добавляет)
+            state_data['buffer'] = clean_text
+            safe_menu_state_set(key, state_data)
+            return True
 
     if current_state == 'manage_set_threshold':
-        try:
-            val = int(clean_text)
-            if val < 0:
-                raise ValueError
-            set_test_fail_threshold(peer_id, val)
-            send_message(peer_id, f"✅ Порог ошибок установлен: {val}.")
-        except:
-            send_message(peer_id, "❌ Введите неотрицательное число.")
-        state_data['state'] = 'manage_test_settings'
-        safe_menu_state_set(key, state_data)
-        time_limit = get_test_time_limit(peer_id)
-        threshold = get_test_fail_threshold(peer_id)
-        msg = f"⚙️ НАСТРОЙКИ ТЕСТИРОВАНИЯ (по одному)\n\n⏱ Время на вопрос: {time_limit} сек\n❌ Порог ошибок: {threshold}\n\nИспользуйте команды для изменения:\n/settime <сек>\n/setthreshold <число>"
-        send_menu(peer_id, sender_id, msg, get_test_settings_keyboard())
-        return True
+        if clean_text == "💾 Сохранить":
+            try:
+                threshold = int(state_data.get('buffer', '').strip())
+                if threshold < 0:
+                    raise ValueError
+                set_test_fail_threshold(peer_id, threshold)
+                send_message(peer_id, f"✅ Порог ошибок установлен: {threshold}.")
+                state_data['buffer'] = ""
+                safe_menu_state_set(key, state_data)
+            except:
+                send_message(peer_id, "❌ Введите неотрицательное целое число (например, 5).")
+                state_data['buffer'] = ""
+                safe_menu_state_set(key, state_data)
+                return True
+            state_data['state'] = 'manage_test_settings'
+            safe_menu_state_set(key, state_data)
+            time_limit = get_test_time_limit(peer_id)
+            threshold = get_test_fail_threshold(peer_id)
+            msg = f"⚙️ НАСТРОЙКИ ТЕСТИРОВАНИЯ (по одному)\n\n⏱ Время на вопрос: {time_limit} сек\n❌ Порог ошибок: {threshold}\n\nИспользуйте команды для изменения:\n/settime <сек>\n/setthreshold <число>"
+            send_menu(peer_id, sender_id, msg, get_test_settings_keyboard())
+            return True
+        else:
+            state_data['buffer'] = clean_text
+            safe_menu_state_set(key, state_data)
+            return True
 
     return False
 
-def get_option_labels(count, type_choice):
-    if type_choice == '1':
-        return [chr(65+i) for i in range(count)]
-    elif type_choice == '2':
-        return [str(i+1) for i in range(count)]
-    elif type_choice == '3':
-        return [chr(1040+i) for i in range(count)]
-    else:
-        return [str(i+1) for i in range(count)]
+# ===== ФУНКЦИЯ ДЛЯ ОТОБРАЖЕНИЯ СТАТУСА ПРИВЕТСТВИЯ =====
+def show_welcome_status(peer_id, sender_id, key):
+    current_text = get_welcome_message(peer_id)
+    enabled = is_welcome_enabled(peer_id)
+    status_text = "ВКЛЮЧЕНО ✅" if enabled else "ОТКЛЮЧЕНО ❌"
+    msg = f"👋 УПРАВЛЕНИЕ ПРИВЕТСТВИЕМ\n\n"
+    msg += f"Статус: {status_text}\n"
+    msg += f"Текст:\n{current_text if current_text else '(не задан)'}\n\n"
+    msg += "Выберите действие:"
+    send_menu(peer_id, sender_id, msg, get_welcome_management_keyboard())
 
 # ======================== ОБРАБОТЧИК CALLBACK ============================
 
@@ -3033,161 +3577,154 @@ def handle_callback(event):
         except Exception:
             pass
 
+    peer_id = event.object.peer_id
+    cmid_to_delete = event.object.conversation_message_id
+
+    if cmd in ("confirm_audience", "confirm_datacenter", "set_notification_chat"):
+        menu_cmid = menu_messages.pop(peer_id, None)
+        if menu_cmid:
+            delete_message(peer_id, menu_cmid, force=True)
+        if cmid_to_delete:
+            delete_message(peer_id, cmid_to_delete, force=True)
+
     if cmd == "confirm_audience":
-        peer_id = event.object.peer_id
-        user_id = str(event.object.user_id)
-
-        if not can_create_audience(user_id):
+        if not can_create_audience(event.object.user_id):
             send_message(peer_id, "❌ У вас нет прав на создание аудиторий.")
-            safe_answer()
             return
-
-        if not bot_is_admin_in_chat(peer_id):
-            send_message(peer_id, "❌ Бот не является администратором этой беседы. Создание аудитории невозможно.")
-            safe_answer()
+        if is_audience_confirmed(peer_id):
+            send_message(peer_id, "⚠️ Эта беседа уже активирована.")
             return
-
-        conn = get_db_connection(None)
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT request_time FROM audiences WHERE peer_id=? AND confirmed=0", (peer_id,))
-            row = cur.fetchone()
-        finally:
-            conn.close()
-        if not row:
-            send_message(peer_id, "❌ Запрос на подтверждение не найден. Используйте /init.")
-            safe_answer()
-            return
-        request_time = row['request_time']
-        if time.time() - request_time > 300:
-            send_message(peer_id, "⏰ Время подтверждения истекло. Используйте /init для нового запроса.")
-            conn = get_db_connection(None)
-            try:
-                conn.execute("DELETE FROM audiences WHERE peer_id=?", (peer_id,))
-                conn.commit()
-            finally:
-                conn.close()
-            safe_answer()
-            return
-
-        dc = get_datacenter_peer_id()
-        if dc is None:
-            send_message(peer_id, "❌ Нет активного датацентра. Сначала создайте датацентр (доступно владельцу или совладельцу).")
-            safe_answer()
-            return
-
-        try:
-            create_audience(peer_id, user_id)
-            send_message(peer_id, f"✅ Аудитория создана! Владелец: {get_user_nickname(user_id)}.\n"
-                                  f"Теперь вы можете управлять материалами через /manage или меню.\n"
-                                  f"Датацентр: {dc}")
+            create_audience(peer_id, event.object.user_id, cmid_to_delete)
+            send_message(peer_id, "✅ Аудитория создана! Теперь вы можете использовать бота.")
         except Exception as e:
             send_message(peer_id, f"❌ Ошибка создания аудитории: {e}")
-        safe_answer()
+        return
 
     elif cmd == "confirm_datacenter":
-        peer_id = event.object.peer_id
-        user_id = str(event.object.user_id)
-
-        if not is_full_access(user_id):
-            send_message(peer_id, "❌ Создание датацентра доступно только владельцу или совладельцу.")
-            safe_answer()
+        if not is_full_access(event.object.user_id):
+            send_message(peer_id, "❌ Только владелец или совладелец может создать датацентр.")
             return
-
-        if not bot_is_admin_in_chat(peer_id):
-            send_message(peer_id, "❌ Бот не является администратором этой беседы. Создание датацентра невозможно.")
-            safe_answer()
+        if is_audience_confirmed(peer_id):
+            send_message(peer_id, "⚠️ Эта беседа уже активирована.")
             return
-
-        conn = get_db_connection(None)
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT request_time FROM audiences WHERE peer_id=? AND confirmed=0", (peer_id,))
-            row = cur.fetchone()
-        finally:
-            conn.close()
-        if not row:
-            send_message(peer_id, "❌ Запрос на подтверждение не найден. Используйте /init.")
-            safe_answer()
-            return
-        request_time = row['request_time']
-        if time.time() - request_time > 300:
-            send_message(peer_id, "⏰ Время подтверждения истекло. Используйте /init для нового запроса.")
-            conn = get_db_connection(None)
-            try:
-                conn.execute("DELETE FROM audiences WHERE peer_id=?", (peer_id,))
-                conn.commit()
-            finally:
-                conn.close()
-            safe_answer()
-            return
-
-        try:
-            create_datacenter(peer_id, user_id)
-            send_message(peer_id, f"⭐ Датацентр создан! Владелец: {get_user_nickname(user_id)}.\n"
-                                  f"Теперь эта беседа использует мастер-базу.\n"
-                                  f"Все ответы на тесты из аудиторий будут приходить сюда.\n"
-                                  f"Другие аудитории могут синхронизироваться с этим датацентром через /sync.")
+            create_datacenter(peer_id, event.object.user_id, cmid_to_delete)
+            send_message(peer_id, "✅ Датацентр создан! Теперь можно создавать аудитории.")
         except Exception as e:
             send_message(peer_id, f"❌ Ошибка создания датацентра: {e}")
-        safe_answer()
+        return
+
+    elif cmd == "set_notification_chat":
+        if not is_owner(event.object.user_id):
+            send_message(peer_id, "❌ Только владелец бота может назначить беседу оповещений.")
+            return
+        set_notification_chat(peer_id)
+        send_message(peer_id, "✅ Эта беседа назначена как беседа оповещений (коллегия).")
+        return
 
     elif cmd == "test_ready":
-        peer_id = event.object.peer_id
-        cmid = event.object.conversation_message_id
-        safe_answer()
-        begin_test(peer_id, cmid)
+        test = active_tests.get(peer_id)
+        if not test:
+            return
+        if not can_manage_materials(event.object.user_id, peer_id):
+            send_message(peer_id, "❌ Только владелец аудитории может начать тест.")
+            return
+        begin_test(peer_id, cmid_to_delete)
+        return
 
     elif cmd == "test_cancel":
-        peer_id = event.object.peer_id
-        cmid = event.object.conversation_message_id
-        safe_answer()
-        cancel_test(peer_id, cmid)
-
-    elif cmd == "test_pause":
-        peer_id = event.object.peer_id
-        user_id = event.object.user_id
-        if not can_control_test(user_id, peer_id):
-            send_message(peer_id, "❌ Только владелец аудитории может управлять тестом.")
-            safe_answer()
+        test = active_tests.get(peer_id)
+        if not test:
             return
-        cmid = event.object.conversation_message_id
-        safe_answer()
-        pause_test(peer_id, cmid)
-
-    elif cmd == "test_resume":
-        peer_id = event.object.peer_id
-        user_id = event.object.user_id
-        if not can_control_test(user_id, peer_id):
-            send_message(peer_id, "❌ Только владелец аудитории может управлять тестом.")
-            safe_answer()
+        if not can_manage_materials(event.object.user_id, peer_id):
+            send_message(peer_id, "❌ Только владелец аудитории может отменить тест.")
             return
-        cmid = event.object.conversation_message_id
-        safe_answer()
-        resume_test(peer_id, cmid)
-
-    elif cmd == "test_end":
-        peer_id = event.object.peer_id
-        user_id = event.object.user_id
-        if not can_control_test(user_id, peer_id):
-            send_message(peer_id, "❌ Только владелец аудитории может управлять тестом.")
-            safe_answer()
-            return
-        cmid = event.object.conversation_message_id
-        safe_answer()
-        end_test_early(peer_id, cmid)
+        cancel_test(peer_id, cmid_to_delete)
+        return
 
     elif cmd == "test_answer":
+        test = active_tests.get(peer_id)
+        if not test:
+            return
+        # Проверяем, есть ли студент в аудитории
+        students = get_audience_students(peer_id)
+        if students:
+            # Если студент есть, то только он может отвечать
+            student_id = students[0]['user_id']
+            if str(event.object.user_id) != str(student_id):
+                send_message(peer_id, "❌ Только текущий студент может отвечать на вопросы.")
+                return
+        # Если студента нет, любой может отвечать (но тест, скорее всего, не запущен)
         handle_test_answer_callback(event)
-        safe_answer()
-    else:
-        safe_answer()
+        return
 
-# -------------------- ФОНОВАЯ ОЧИСТКА --------------------
+    elif cmd == "test_pause":
+        test = active_tests.get(peer_id)
+        if not test:
+            return
+        if not can_manage_materials(event.object.user_id, peer_id):
+            send_message(peer_id, "❌ Только владелец аудитории может управлять тестом.")
+            return
+        pause_test(peer_id, cmid_to_delete)
+        return
+
+    elif cmd == "test_resume":
+        test = active_tests.get(peer_id)
+        if not test:
+            return
+        if not can_manage_materials(event.object.user_id, peer_id):
+            send_message(peer_id, "❌ Только владелец аудитории может управлять тестом.")
+            return
+        resume_test(peer_id, cmid_to_delete)
+        return
+
+    elif cmd == "test_end":
+        test = active_tests.get(peer_id)
+        if not test:
+            return
+        if not can_manage_materials(event.object.user_id, peer_id):
+            send_message(peer_id, "❌ Только владелец аудитории может завершить тест.")
+            return
+        end_test_early(peer_id, cmid_to_delete)
+        return
+
+    elif cmd == "notify_stage":
+        # Проверка прав
+        if not can_manage_materials(event.object.user_id, peer_id):
+            send_message(peer_id, "❌ У вас нет прав на отправку уведомлений в этой аудитории.")
+            return
+        stage = payload.get('stage')
+        chat = get_notification_chat()
+        if chat:
+            audience_name = get_chat_name(peer_id) or f"Беседа {peer_id}"
+            stage_names = {1: "собеседование", 2: "лекция", 3: "тесты", 4: "творческое"}
+            stage_name = stage_names.get(stage, "этап")
+            owner_id = get_audience_owner(peer_id)
+            owner_mention = get_user_mention(owner_id, peer_id) if owner_id else "Неизвестно"
+            students = get_audience_students(peer_id)
+            if students:
+                student_mentions = ", ".join([get_user_mention(s['user_id'], peer_id) for s in students])
+                notify_text = f"📢 Аудитория: {audience_name}\nРектор: {owner_mention}\nСтудент: {student_mentions}\nПриступил к {stage} этапу ({stage_name})"
+            else:
+                notify_text = f"📢 Аудитория: {audience_name}\nРектор: {owner_mention}\nСтудент: нет\n(этап {stage} не начат)"
+            send_notification(notify_text)
+        if cmid_to_delete:
+            delete_message(peer_id, cmid_to_delete, force=True)
+        return
+        
+    elif cmd == "skip_notification":
+        if not can_manage_materials(event.object.user_id, peer_id):
+            send_message(peer_id, "❌ У вас нет прав на пропуск уведомления.")
+            return
+        if cmid_to_delete:
+            delete_message(peer_id, cmid_to_delete, force=True)
+        return
+# ======================== ФОН ВЫПОЛНЕНИЕ (ОЧИСТКА) ============================
 
 def background_cleanup():
     while True:
-        time.sleep(86400)
+        time.sleep(3600)
 
 # ======================== ОСНОВНОЙ ЦИКЛ ============================
 
@@ -3195,6 +3732,20 @@ def main():
     global vk, longpoll
     vk_session = vk_api.VkApi(token=GROUP_TOKEN)
     vk = vk_session.get_api()
+    error_handler = VkErrorHandler()
+    error_handler.setLevel(logging.ERROR)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    error_handler.setFormatter(formatter)
+    logger.addHandler(error_handler)
+    send_to_owner("✅ Бот успешно запущен и готов к работе!")
+    try:
+        if os.path.exists(RESTART_PEER_FILE):
+            with open(RESTART_PEER_FILE, 'r') as f:
+                peer_id = int(f.read().strip())
+            send_message(peer_id, "✅ Бот успешно перезапущен и готов к работе!")
+            os.remove(RESTART_PEER_FILE)
+    except Exception as e:
+        logger.error(f"Ошибка отправки уведомления о перезапуске в беседу: {e}")
     try:
         longpoll = VkBotLongPoll(vk_session, GROUP_ID, wait=45)
         print("✅ Бот запущен")
@@ -3203,9 +3754,14 @@ def main():
         sys.exit(1)
 
     init_main_db()
+    cleanup_audience_dbs()
+    auto_repair_audiences()
 
     cleanup_thread = threading.Thread(target=background_cleanup, daemon=True)
     cleanup_thread.start()
+    # === ПЛАНИРОВЩИК ПЕРЕЗАПУСКА ===
+    restart_timer = schedule_daily_restart()
+    # ================================
 
     bot_id = -int(GROUP_ID)
 
@@ -3221,6 +3777,9 @@ def main():
                     peer_id = msg['peer_id']
                     text = msg['text'].strip()
                     sender_id = str(msg['from_id'])
+
+                    if peer_id == get_notification_chat():
+                        continue
 
                     if peer_id >= 2000000000 and is_audience_confirmed(peer_id):
                         update_audience_activity(peer_id)
@@ -3242,6 +3801,11 @@ def main():
                             continue
                         elif action_type == 'chat_kick_user' and member_id == bot_id:
                             logger.info(f"❌ Бот удалён из беседы {peer_id}")
+                        elif action_type == 'chat_invite_user' and member_id != bot_id:
+                            if is_audience_confirmed(peer_id) and is_welcome_enabled(peer_id):
+                                welcome = get_welcome_message(peer_id)
+                                if welcome:
+                                    send_message(peer_id, f"👋 {get_user_mention(member_id, peer_id)}, {welcome}")
 
                     if text.startswith('/'):
                         handle_command(text, peer_id, sender_id)
