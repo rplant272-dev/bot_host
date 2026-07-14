@@ -673,6 +673,21 @@ def get_notification_chat():
 
 def set_notification_chat(peer_id):
     set_setting("notification_chat_id", str(peer_id), None)
+    # Также создаём запись в audiences, чтобы auto_repair_audiences не сбросил
+    conn = get_db_connection(None)
+    try:
+        # Если записи нет – создаём с confirmed=1
+        conn.execute(
+            "INSERT OR REPLACE INTO audiences (peer_id, owner_id, confirmed, request_time, request_message_id, is_datacenter, last_activity) "
+            "VALUES (?, ?, 1, ?, ?, 0, ?)",
+            (peer_id, None, int(time.time()), None, int(time.time()))
+        )
+        conn.commit()
+        logger.info(f"Беседа {peer_id} добавлена в audiences как коллегия (confirmed=1)")
+    except Exception as e:
+        logger.error(f"Ошибка добавления коллегии в audiences: {e}")
+    finally:
+        conn.close()
 
 def send_notification(text):
     chat = get_notification_chat()
@@ -2047,6 +2062,7 @@ def start_one_by_one_test(peer_id, topic, variant, sender_id):
         'total': len(questions_with_options),
         'finished': False,
         'timer': None,
+        'start_timer': None,   # Добавлено для отслеживания таймера задержки 5 секунд
         'cmid': None,
         'started': False,
         'paused': False,
@@ -2059,12 +2075,28 @@ def begin_test(peer_id, cmid):
         return
     test['cmid'] = cmid
     test['started'] = True
-    send_next_question(peer_id)
+
+    # Сообщение о старте с задержкой 5 секунд
+    edit_message(peer_id, cmid, "📝 Тест начат! Подождите 5 секунд...", keyboard=get_empty_keyboard())
+
+    def start_questions():
+        # Проверяем, не был ли тест отменён за это время
+        if test.get('finished', False):
+            return
+        send_next_question(peer_id)
+
+    timer = threading.Timer(5.0, start_questions)
+    timer.daemon = True
+    timer.start()
+    test['start_timer'] = timer
 
 def cancel_test(peer_id, cmid):
     test = active_tests.pop(peer_id, None)
     if not test:
         return
+    # Отменяем таймер задержки старта, если он ещё активен
+    if test.get('start_timer'):
+        test['start_timer'].cancel()
     if cmid:
         edit_message(peer_id, cmid, "❌ Тест отменён.", keyboard=get_empty_keyboard())
 
@@ -2197,6 +2229,9 @@ def finish_test(peer_id, success, reason=None):
     test = active_tests.pop(peer_id, None)
     if not test:
         return
+    # Отменяем оба таймера (задержки и вопроса)
+    if test.get('start_timer'):
+        test['start_timer'].cancel()
     if test.get('timer'):
         test['timer'].cancel()
     total = test['total']
@@ -2277,7 +2312,9 @@ def handle_test_answer_callback(event):
         return
     cmid = test.get('cmid')
     if cmid:
-        edit_message(peer_id, cmid, "⏳ Следующий вопрос...", keyboard=get_empty_keyboard())
+        # Показываем только выбранный ответ, без указания правильности
+        prev_text = f'Был дан ответ: "{chosen_text}"\n⏳ Следующий вопрос...'
+        edit_message(peer_id, cmid, prev_text, keyboard=get_empty_keyboard())
         def show_next():
             time.sleep(1.5)
             if test.get('finished', False):
